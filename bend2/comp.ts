@@ -4224,7 +4224,7 @@ static struct {
   int      prof;
   u64      calls, loops;
   double   ms, flop;
-} FT = { .mu = PTHREAD_MUTEX_INITIALIZER };
+} FT = { .mu = PTHREAD_MUTEX_INITIALIZER, .prof = -1 };
 
 static void ft_report(void) {
   fprintf(stderr, "bend profile: gemm %llu calls (%llu as loops), %.3f ms,"
@@ -4243,11 +4243,6 @@ static bool ft_open(void) {
     return FT.state > 0;
   }
   FT.state = -1;
-  const char* pr = getenv("BEND_PROFILE");
-  FT.prof = pr == NULL ? 0 : atoi(pr) > 1 ? 2 : 1;
-  if (FT.prof) {
-    atexit(ft_report);
-  }
   const char* g = getenv("BEND_GEMM");
   if (g != NULL && strcmp(g, "loop") == 0) {
     return false;
@@ -4282,6 +4277,18 @@ static bool ft_open(void) {
   return true;
 }
 
+// BEND_PROFILE, read before the first call is timed
+static int ft_prof(void) {
+  if (FT.prof < 0) {
+    const char* pr = getenv("BEND_PROFILE");
+    FT.prof = pr == NULL ? 0 : atoi(pr) > 1 ? 2 : 1;
+    if (FT.prof) {
+      atexit(ft_report);
+    }
+  }
+  return FT.prof;
+}
+
 static double ft_now(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -4304,7 +4311,7 @@ OUTLINE Term ft_gemm(Env e, u64 ta, u64 tb, u64 m, u64 n, u64 k, u64 nb,
   u32 m_ = (u32)m, n_ = (u32)n, k_ = (u32)k, nb_ = (u32)nb;
   f32 al = f32_unbox(alpha), be = f32_unbox(beta);
 #if !DEVICE && BEND_CUDA
-  double t0 = FT.prof ? ft_now() : 0;
+  double t0 = ft_gpu && ft_prof() ? ft_now() : 0;
   u32 ta_ = (u32)ta != 0, tb_ = (u32)tb != 0;
   bool fast = ft_gpu && m_ > 0 && n_ > 0 && k_ > 0 && nb_ > 0
     && m_ <= 0x7FFFFFFF && n_ <= 0x7FFFFFFF && k_ <= 0x7FFFFFFF
@@ -4342,7 +4349,7 @@ OUTLINE Term ft_gemm(Env e, u64 ta, u64 tb, u64 m, u64 n, u64 k, u64 nb,
       (u32)ldc, (u32)sc);
 #if !DEVICE && BEND_CUDA
   }
-  if (FT.prof) {
+  if (ft_gpu && FT.prof > 0) {
     double ms = ft_now() - t0;
     FT.calls += 1;
     FT.ms    += ms;
