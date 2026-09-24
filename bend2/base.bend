@@ -266,6 +266,13 @@ def File.write(file: File, data: String) ->
   import "./effs/file_write.c"
   import "./effs/file_write.js"
 
+# Up to max bytes at byte off (fewer at the end of the file), as
+# File.read_bytes answers them; the file's position does not move.
+def File.read_at(file: File, off: U32, max: U32) ->
+  IO(File & Result<&1, &1, U32 & String, List<&2, U32>>):
+  import "./effs/file_read_at.c"
+  import "./effs/file_read_at.js"
+
 # Bytes as they are: the low byte of each U32, no UTF-8 (File.write's
 # String is text, so it cannot carry a byte >= 0x80 alone).
 def File.write_bytes(file: File, data: List<&2, U32>) ->

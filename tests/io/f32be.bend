@@ -3,7 +3,8 @@
 # come back through File.read_bytes unchanged; read_f32be at a byte
 # offset equals decoding those bytes (F32{w} of each big-endian word)
 # into Array.set, including a wrapped index; write_f32be of that array
-# gives back the same bytes.
+# gives back the same bytes; read_at from byte 13 is the last word's
+# four bytes (a read past the end is short, not an error).
 import Base
 
 law bytes:
@@ -136,6 +137,18 @@ def back_go(m):
     p : Unit <- IO.print(say(eq(xs, after()), "write-same", "write-differs"))
     return 0
 
+law tail_go:
+  for m: File & Result<&1, &1, (U32 & String), List<&2, U32>>
+  IO(U32)
+
+def tail_go(m):
+  (f, r) = m
+  do IO<U32>:
+    xs : List<&2, U32> <- IO.pass(List<&2, U32>, r)
+    c : Unit <- File.close(f)
+    p : Unit <- IO.print(say(eq(xs, [65, 32, 0, 0]), "tail-same", "tail-differs"))
+    return 0
+
 law wrote:
   for m: File & Array<F32> & Result<&1, &1, (U32 & String), Unit>
   IO(Unit)
@@ -172,7 +185,11 @@ def main():
     b : Unit <- wrote(n)
     k : File <- IO.try(File, File.open("/tmp/bend_io_f32be.out", "r"))
     o : File & Result<&1, &1, (U32 & String), List<&2, U32>> <- File.read_bytes(k, 64)
-    back_go(o)
+    z : U32 <- back_go(o)
+    t : File <- IO.try(File, File.open("/tmp/bend_io_f32be.bin", "r"))
+    u : File & Result<&1, &1, (U32 & String), List<&2, U32>> <- File.read_at(t, 13, 64)
+    tail_go(u)
 
 #|read-same
 #|write-same
+#|tail-same
