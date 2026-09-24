@@ -266,6 +266,30 @@ def File.write(file: File, data: String) ->
   import "./effs/file_write.c"
   import "./effs/file_write.js"
 
+# Bytes as they are: the low byte of each U32, no UTF-8 (File.write's
+# String is text, so it cannot carry a byte >= 0x80 alone).
+def File.write_bytes(file: File, data: List<&2, U32>) ->
+  IO(File & Result<&1, &1, U32 & String, Unit>):
+  import "./effs/file_write_bytes.c"
+  import "./effs/file_write_bytes.js"
+
+# Bulk F32 I/O for Array<F32>. The meaning of read_f32be(f, off, n, x, at)
+# is: bytes [off, off+4n) of f, read as n big-endian F32 (F32{w} of each
+# U32 w), set into x at at, at+1, ... (Array.set's wrapping indices); f's
+# position does not move. write_f32be(f, n, x, at) writes x[at .. at+n-1]
+# the same way at f's position. They are effects because files are; each
+# is File.read_bytes / File.write_bytes folded with Array.set / Array.get,
+# which tests/io/f32be.bend checks them against.
+def File.read_f32be(file: File, off: U32, n: U32, x: Array<F32>, at: U32) ->
+  IO(File & Array<F32> & Result<&1, &1, U32 & String, Unit>):
+  import "./effs/file_read_f32be.c"
+  import "./effs/file_read_f32be.js"
+
+def File.write_f32be(file: File, n: U32, x: Array<F32>, at: U32) ->
+  IO(File & Array<F32> & Result<&1, &1, U32 & String, Unit>):
+  import "./effs/file_write_f32be.c"
+  import "./effs/file_write_f32be.js"
+
 def File.close(file: File) -> IO(Unit):
   import "./effs/file_close.c"
   import "./effs/file_close.js"
