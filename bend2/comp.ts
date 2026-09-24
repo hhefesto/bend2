@@ -4989,6 +4989,54 @@ static FtKern* ft_kern(const FtSpec* s) {
   return k;
 }
 
+// Strategy tuning: each (kernel, shape) tries its candidate strategies on
+// its first occurrences, each timed alone, then keeps the fastest. Every
+// strategy computes the same sum, so the choice is invisible but for
+// rounding.
+typedef struct FtTune {
+  u64            key;
+  u32            nout, nred, ncand, tried;
+  int            cand[3], best;
+  double         t[3];
+  struct FtTune* next;
+} FtTune;
+
+static FtTune* FT_TUNES;
+
+static FtTune* ft_tune(u64 key, u64 nout, u64 nred) {
+  for (FtTune* t = FT_TUNES; t != NULL; t = t->next) {
+    if (t->key == key && t->nout == nout && t->nred == nred) {
+      return t;
+    }
+  }
+  FtTune* t = calloc(1, sizeof *t);
+  if (t == NULL) {
+    err_fail("out of memory");
+  }
+  t->key  = key;
+  t->nout = (u32)nout;
+  t->nred = (u32)nred;
+  t->best = -1;
+  if (nred <= 1) {
+    t->cand[0] = 0;
+    t->ncand   = 1;
+  } else if (nout >= 1024) {
+    t->cand[0] = 0;
+    t->cand[1] = 1;
+    t->ncand   = 2;
+  } else {
+    t->cand[0] = 1;
+    t->cand[1] = 2;
+    t->ncand   = 2;
+  }
+  if (t->ncand == 1) {
+    t->best = t->cand[0];
+  }
+  t->next  = FT_TUNES;
+  FT_TUNES = t;
+  return t;
+}
+
 static u32 ft_grid(u64 threads) {
   u64 b = (threads + 255) / 256;
   return (u32)(b < 1 ? 1 : b > (1u << 20) ? (1u << 20) : b);
@@ -5018,9 +5066,16 @@ static void ft_einsum_gpu(Env e, const FtSpec* s, Term x) {
   a.o    = s->out;
   memcpy(a.in, s->in, sizeof a.in);
   CUdeviceptr S = (CUdeviceptr)(uintptr_t)ft_cell(e.mem, x, 0);
-  const char* st = getenv("BEND_FT_STRAT");
+  const char* st   = getenv("BEND_FT_STRAT");
+  FtTune*     tu   = st != NULL ? NULL : ft_tune(k->key, nout, nred);
+  bool        trial = tu != NULL && tu->best < 0;
   u32 strat = st != NULL ? (u32)atoi(st)
-    : nred <= 16 ? 0 : (nout >= 1024 || nred <= 65536) ? 1 : 2;
+    : trial ? (u32)tu->cand[tu->tried] : (u32)tu->best;
+  double t0 = 0;
+  if (trial) {
+    cuStreamSynchronize(FT.st);
+    t0 = ft_now();
+  }
   CUresult rc;
   if (strat == 2) {
     u64 want = (nred + 16383) / 16384;
@@ -5052,6 +5107,18 @@ static void ft_einsum_gpu(Env e, const FtSpec* s, Term x) {
     fprintf(stderr, "bend: einsum kernel failed (%d): %s\n", (int)rc,
       s->extext);
     err_fail("device fault");
+  }
+  if (trial) {
+    cuStreamSynchronize(FT.st);
+    tu->t[tu->tried] = ft_now() - t0;
+    tu->tried += 1;
+    if (tu->tried == tu->ncand) {
+      u32 b = 0;
+      for (u32 i = 1; i < tu->ncand; i += 1) {
+        b = tu->t[i] < tu->t[b] ? i : b;
+      }
+      tu->best = tu->cand[b];
+    }
   }
 }
 
