@@ -212,6 +212,12 @@ def IO.now() -> IO(Nat):
   import "./effs/now.c"
   import "./effs/now.js"
 
+# wall-clock time: milliseconds since the Unix epoch (IO.now is a monotonic
+# stopwatch, for durations; this one is for timestamps)
+def IO.time() -> IO(Nat):
+  import "./effs/time.c"
+  import "./effs/time.js"
+
 def Chan.new(-A: Type, room: U32) -> IO(Chan(A)):
   import "./effs/chan_new.c"
   import "./effs/chan_new.js"
