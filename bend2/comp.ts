@@ -63,6 +63,7 @@ type Src = { refs: Set<Bend.Name>; deps: Set<Bend.Name>; flat: boolean };
 type Carb = {
   book: Book;
   bangs: Set<Bend.Name>;
+  ftops: Set<Bend.Name>;
   sites: Map<Bend.Name, number>;
   hot: Set<Bend.Name>;
   stat: Set<Bend.Name>;
@@ -124,9 +125,9 @@ type Call = {
 };
 
 type Intr = {
-  C?: Gen | string[];
+  C?: Gen | Gen[];
   call?: boolean;
-  JS: Gen;
+  JS?: Gen;
 };
 
 type Dom = [Bend.Quant, Bend.Name, HTerm];
@@ -304,12 +305,21 @@ const OPERATIONS: Record<string, Intr> = Object.setPrototypeOf({
     call: true,
     JS:   "{$: \"Tuple\", fst: $0, snd: $0.length}",
   },
+  // (C, A, B): base.bend's Array.gemm, run by ft_gemm (cuBLAS or a loop)
+  array_gemm: {
+    C: [(xs) => `ft_gemm(e, ${xs.slice(0, 20).join(", ")})`,
+      (xs) => xs[7], (xs) => xs[11]],
+  },
   array_clone: {
     C:    ["blk_copy(e, $0)", "$0"],
     call: true,
     JS:   "{$: \"Tuple\", fst: $0, snd: $0.slice()}",
   },
 }, null);
+
+// The bulk F32 ops (the Ft section of the C runtime): a program that uses
+// one maps its heap to the GPU even with no bang.
+const FT_OPS = ["array_gemm"];
 
 // Optimized
 // ---------
@@ -837,8 +847,9 @@ function intr_of(c: Carb, k: Bend.Name, js = false): Intr | undefined {
   const tld = c.book.tlds[k];
   const it = tld?.$ === "Def" && tld.i === undefined && (tld.b || tld.v === null)
     ? OPERATIONS[eff_name(k)] : undefined;
-  return it !== undefined && (js || it.C !== undefined || it.call === true)
-    ? it : undefined;
+  // an op with no JS form runs its Bend definition on the JS lane
+  return it !== undefined && (js ? it.JS !== undefined
+    : it.C !== undefined || it.call === true) ? it : undefined;
 }
 
 // Call
@@ -1378,7 +1389,7 @@ function def_body(cb: Carb, k: Bend.Name): TLD | undefined {
 // each one's source summary (SRCS): what it refers to, what it calls (a
 // reference used as a value is no call; Clo.apply is never flat), and
 // whether it is flat: no fork, no bang call, self-calls in tail position.
-function carb_book(src: Bend.Book, roots: Bend.Name[]): Carb {
+function carb_book(src: Bend.Book, roots: Bend.Name[], js = false): Carb {
   [TELES, SRCS, NODES, CYCLES, FLATS, SIGS, BRWS].forEach((m) => m.clear());
   LOCAL.clear();
   for (const [k, tld] of Object.entries(src.tlds)) {
@@ -1389,6 +1400,7 @@ function carb_book(src: Bend.Book, roots: Bend.Name[]): Carb {
   const cb: Carb = {
     book: { ...src, tlds: { ...src.tlds } },
     bangs: new Set(),
+    ftops: new Set(),
     sites: new Map(),
     hot: new Set(),
     stat: new Set(),
@@ -1418,7 +1430,12 @@ function carb_book(src: Bend.Book, roots: Bend.Name[]): Carb {
         if (s.b) {
           cb.bangs.add(s.k);
         }
-        if (intr_of(cb, s.k) === undefined) {
+        if (FT_OPS.includes(eff_name(s.k)) && intr_of(cb, s.k)) {
+          cb.ftops.add(s.k);
+        }
+        // the JS lane runs an op with no JS form as its definition
+        if (intr_of(cb, s.k) === undefined
+          || (js && intr_of(cb, s.k, true) === undefined)) {
           own.refs.add(s.k);
           cb.sites.set(s.k, (cb.sites.get(s.k) ?? 0) + 1);
         }
@@ -2784,7 +2801,8 @@ function compile_tables(fl: File, entries: Seg[]): string[] {
     `    case ${i}: ${r} = (X); \\\n      break; \\\n`).join("");
   defs.push(`#define IO_HOTS ${"SCon Tuple Done Fail Con Some".split(" ")
     .reduce((m, k, i) => m | (fl.hot.has(k) ? 1 << i : 0), 0)}`, "",
-  `#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+  `#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`,
+  `#define FTOPS   ${fl.ftops.size}`, "",
   `#define WL_BANK Term ${ws.join(", ")};`, "",
   `#define WL_LOAD(A, N) \\\n  do { \\\n${load}  } while (0);`, "",
   `#define WL_LAST(X) \\\n  switch (war) { \\\n${last}  }`, "",
@@ -3099,7 +3117,7 @@ function js_def(fl: File, k: Bend.Name, def: Def): void {
 
 export function js_lib(book: Bend.Book, roots: Bend.Name[],
   outs: Bend.Name[] | null): string {
-  const cb = carb_book(book, roots.slice());
+  const cb = carb_book(book, roots.slice(), true);
   const fl = file_new(cb, "const");
   fl.tab = 0;
   for (const [k, def] of done_defs(cb)) {
@@ -3177,6 +3195,7 @@ using namespace metal;
 #elif BEND_CUDA
 #include <cuda.h>
 #include <nvrtc.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #endif
@@ -4136,6 +4155,208 @@ INLINE Term blk_new(Env e, bool arr, Nat d, u32 lgs, u32 n, THR Term* v) {
   return term_blk(arr, c, l);
 }
 
+// Ft
+// ==
+
+// Bulk F32 ops over whole arrays. Each is a def in base.bend, and that
+// def is its meaning: Array.gemm is C ← α·op(A)·op(B) + β·C read through
+// ArrayView.at, every index wrapped into its array. ft_gemm_loop is that
+// definition in C, the same sums in the same order (fp contract is off),
+// and it runs on every lane. A CUDA build whose program uses a bulk op
+// hands a call to cuBLAS instead when its views fit: no index wraps and no
+// two C entries share a cell, so the order of the writes cannot matter.
+
+INLINE u32 ft_at(u32 t, u32 o, u32 ld, u32 s, u32 b, u32 r, u32 c) {
+  return o + b * s + (t == 0 ? r * ld + c : c * ld + r);
+}
+
+INLINE DEV u32a* ft_cell(Corpus H, Term a, u32 i) {
+  return blk_ptr(H, term_loc(a), i & (u32)((1ull << blk_cls(a)) - 1));
+}
+
+INLINE f32 ft_get(Corpus H, Term a, u32 i) {
+  return f32_unbox((u64)*ft_cell(H, a, i));
+}
+
+OUTLINE void ft_gemm_loop(Env e, u32 ta, u32 tb, u32 m, u32 n, u32 k,
+  u32 nb, f32 alpha, Term a, u32 ao, u32 lda, u32 sa, Term b, u32 bo,
+  u32 ldb, u32 sb, f32 beta, Term c, u32 co, u32 ldc, u32 sc) {
+  Corpus H = e.mem;
+  for (u32 bi = 0; bi < nb; bi += 1) {
+    for (u32 i = 0; i < m; i += 1) {
+      for (u32 j = 0; j < n; j += 1) {
+        f32 s = 0.0f;
+        for (u32 q = 0; q < k; q += 1) {
+          f32 x = ft_get(H, a, ft_at(ta, ao, lda, sa, bi, i, q));
+          f32 y = ft_get(H, b, ft_at(tb, bo, ldb, sb, bi, q, j));
+          s = s + x * y;
+        }
+        DEV u32a* p = ft_cell(H, c, ft_at(0, co, ldc, sc, bi, i, j));
+        f32 v = alpha * s;
+        if (!(beta == 0.0f)) {
+          v = v + beta * f32_unbox((u64)*p);
+        }
+        *p = (u32)f32_rewrap(v);
+      }
+    }
+  }
+}
+
+#if !DEVICE && BEND_CUDA
+
+// on when main mapped the heap to the GPU for a program with bulk ops
+static bool ft_gpu;
+
+typedef int (*FtGemmEx)(void*, int, int, int, int, int, const void*,
+  const void*, int, int, long long, const void*, int, int, long long,
+  const void*, void*, int, int, long long, int, int, int);
+
+// Any worker thread may reach a bulk op: each call takes the lock and makes
+// the primary context current on its thread.
+static struct {
+  int       state; // 0 untried, 1 ready, -1 unavailable
+  lock      mu;
+  CUcontext ctx;
+  void*     h;
+  CUstream  st;
+  int      compute;
+  FtGemmEx gemm;
+  int      prof;
+  u64      calls, loops;
+  double   ms, flop;
+} FT = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+static void ft_report(void) {
+  fprintf(stderr, "bend profile: gemm %llu calls (%llu as loops), %.3f ms,"
+    " %.3f GFLOP, %.1f GFLOP/s\n", (unsigned long long)FT.calls,
+    (unsigned long long)FT.loops, FT.ms, FT.flop / 1e9,
+    FT.ms > 0 ? FT.flop / FT.ms / 1e6 : 0.0);
+}
+
+// cuBLAS by dlopen: a build needs no cuBLAS headers, and a box without the
+// library runs the loop. BEND_CUBLAS names the library;
+// BEND_GEMM_NUMERICS is fp32 (the default), tf32 or bf16; BEND_GEMM=loop
+// keeps every call on the loop (the oracle); BEND_PROFILE=1 sums the calls
+// at exit, 2 also prints each one.
+static bool ft_open(void) {
+  if (FT.state != 0) {
+    return FT.state > 0;
+  }
+  FT.state = -1;
+  const char* pr = getenv("BEND_PROFILE");
+  FT.prof = pr == NULL ? 0 : atoi(pr) > 1 ? 2 : 1;
+  if (FT.prof) {
+    atexit(ft_report);
+  }
+  const char* g = getenv("BEND_GEMM");
+  if (g != NULL && strcmp(g, "loop") == 0) {
+    return false;
+  }
+  const char* nm = getenv("BEND_GEMM_NUMERICS");
+  FT.compute = nm == NULL || strcmp(nm, "fp32") == 0 ? 69
+    : strcmp(nm, "tf32") == 0 ? 77 : strcmp(nm, "bf16") == 0 ? 75 : 0;
+  if (FT.compute == 0) {
+    err_fail("BEND_GEMM_NUMERICS must be fp32, tf32 or bf16");
+  }
+  const char* so[] = { getenv("BEND_CUBLAS"), "libcublas.so",
+    "libcublas.so.13", "libcublas.so.12", "libcublas.so.11" };
+  void* lib = NULL;
+  for (u32 i = 0; i < 5 && lib == NULL; i += 1) {
+    lib = so[i] == NULL ? NULL : dlopen(so[i], RTLD_NOW | RTLD_GLOBAL);
+  }
+  int (*create)(void**) = lib ? (int (*)(void**))dlsym(lib,
+    "cublasCreate_v2") : NULL;
+  int (*stream)(void*, CUstream) = lib ? (int (*)(void*, CUstream))dlsym(lib,
+    "cublasSetStream_v2") : NULL;
+  FT.gemm = lib ? (FtGemmEx)dlsym(lib, "cublasGemmStridedBatchedEx") : NULL;
+  if (create == NULL || stream == NULL || FT.gemm == NULL
+    || cuDevicePrimaryCtxRetain(&FT.ctx, gpu_dev) != CUDA_SUCCESS
+    || cuCtxSetCurrent(FT.ctx) != CUDA_SUCCESS
+    || cuStreamCreate(&FT.st, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS
+    || create(&FT.h) != 0 || stream(FT.h, FT.st) != 0) {
+    fprintf(stderr, "bend: cuBLAS unavailable (%s); Array.gemm runs as a"
+      " loop on the CPU\n", lib ? "setup failed" : dlerror());
+    return false;
+  }
+  FT.state = 1;
+  return true;
+}
+
+static double ft_now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
+
+// a view's stored matrices lie inside its array, without wrapping
+static bool ft_fits(Term a, u64 rows, u64 cols, u64 o, u64 ld, u64 s,
+  u64 nb) {
+  u64 top = o + (nb - 1) * s + (rows - 1) * ld + (cols - 1);
+  return ld >= cols && ld <= 0x7FFFFFFF && top < (1ull << blk_cls(a))
+    && top < (1ull << 32);
+}
+
+#endif
+
+OUTLINE Term ft_gemm(Env e, u64 ta, u64 tb, u64 m, u64 n, u64 k, u64 nb,
+  u64 alpha, Term a, u64 ao, u64 lda, u64 sa, Term b, u64 bo, u64 ldb,
+  u64 sb, u64 beta, Term c, u64 co, u64 ldc, u64 sc) {
+  u32 m_ = (u32)m, n_ = (u32)n, k_ = (u32)k, nb_ = (u32)nb;
+  f32 al = f32_unbox(alpha), be = f32_unbox(beta);
+#if !DEVICE && BEND_CUDA
+  double t0 = FT.prof ? ft_now() : 0;
+  u32 ta_ = (u32)ta != 0, tb_ = (u32)tb != 0;
+  bool fast = ft_gpu && m_ > 0 && n_ > 0 && k_ > 0 && nb_ > 0
+    && m_ <= 0x7FFFFFFF && n_ <= 0x7FFFFFFF && k_ <= 0x7FFFFFFF
+    && ft_fits(a, ta_ ? k_ : m_, ta_ ? m_ : k_, (u32)ao, (u32)lda,
+      (u32)sa, nb_)
+    && ft_fits(b, tb_ ? n_ : k_, tb_ ? k_ : n_, (u32)bo, (u32)ldb,
+      (u32)sb, nb_)
+    && ft_fits(c, m_, n_, (u32)co, (u32)ldc, (u32)sc, nb_)
+    && (nb_ == 1 || (u64)(u32)sc >= ((u64)m_ - 1) * (u32)ldc + n_);
+  if (fast) {
+    pthread_mutex_lock(&FT.mu);
+    fast = ft_open() && cuCtxSetCurrent(FT.ctx) == CUDA_SUCCESS;
+    if (!fast) {
+      pthread_mutex_unlock(&FT.mu);
+    }
+  }
+  if (fast) {
+    Corpus H = e.mem;
+    // row-major C = op(A)·op(B) is column-major Cᵀ = op(B)ᵀ·op(A)ᵀ
+    int st = FT.gemm(FT.h, (int)tb_, (int)ta_, (int)n_, (int)m_, (int)k_,
+      &al, (void*)ft_cell(H, b, (u32)bo), 0, (int)(u32)ldb,
+      (long long)(u32)sb, (void*)ft_cell(H, a, (u32)ao), 0, (int)(u32)lda,
+      (long long)(u32)sa, &be, (void*)ft_cell(H, c, (u32)co), 0,
+      (int)(u32)ldc, (long long)(u32)sc, (int)nb_, FT.compute, -1);
+    if (st != 0 || cuStreamSynchronize(FT.st) != CUDA_SUCCESS) {
+      fprintf(stderr, "bend: cuBLAS gemm failed (status %d)\n", st);
+      err_fail("device fault");
+    }
+    pthread_mutex_unlock(&FT.mu);
+  } else {
+    FT.loops += 1;
+#endif
+    ft_gemm_loop(e, (u32)ta, (u32)tb, m_, n_, k_, nb_, al, a, (u32)ao,
+      (u32)lda, (u32)sa, b, (u32)bo, (u32)ldb, (u32)sb, be, c, (u32)co,
+      (u32)ldc, (u32)sc);
+#if !DEVICE && BEND_CUDA
+  }
+  if (FT.prof) {
+    double ms = ft_now() - t0;
+    FT.calls += 1;
+    FT.ms    += ms;
+    FT.flop  += 2.0 * m_ * n_ * k_ * nb_;
+    if (FT.prof > 1) {
+      fprintf(stderr, "bend profile: gemm %s %ux%ux%u x%u %.3f ms %.1f"
+        " GFLOP/s\n", fast ? "cublas" : "loop", m_, n_, k_, nb_, ms,
+        2.0 * m_ * n_ * k_ * nb_ / ms / 1e6);
+    }
+  }
+#endif
+  return c;
+}
+
 // Ring
 // ====
 
@@ -5051,21 +5272,26 @@ static void cube_run(Corpus H, bool gpu) {
 // Corpus
 // ======
 
-static Corpus corpus_setup(bool gpu, long threads, u64 bytes) {
+// ft: the program has bulk ops and a GPU: the heap is managed memory, so
+// cuBLAS and the kernels read arrays where they lie, while the rest of the
+// program runs on the CPU threads as before.
+static Corpus corpus_setup(bool gpu, bool ft, long threads, u64 bytes) {
   io_gpu     = gpu;
   KEEP_WORDS = gpu ? CHUNK : CAP_WORDS;
-  u64 dflt   = gpu ? gpu_span() : 1ull << 43;
-  u64 size   = (gpu && bytes != 0 ? bytes : dflt) & ~16383ull;
+  bool map   = gpu || ft;
+  u64 dflt   = map ? gpu_span() : 1ull << 43;
+  u64 size   = (map && bytes != 0 ? bytes : dflt) & ~16383ull;
   u64 span = size / 8;
   u64 cap  = span > HEAP_OFF ? (span - HEAP_OFF) / (PAGE_LEN + 10) : 0;
   if (cap <= CUBE) {
     err_fail("the GPU span is under the rings, stacks and a page per lane");
   }
   cap = cap < ~0u ? cap : ~0u - 1;
-  CORPUS = gpu ? gpu_map(size) : pool_mmap(size);
+  CORPUS = map ? gpu_map(size) : pool_mmap(size);
   Corpus H  = CORPUS;
 #if BEND_CUDA
-  if (gpu) {
+  ft_gpu = ft;
+  if (map) {
     cuMemsetD8((CUdeviceptr)(uintptr_t)H, 0, STAK_OFF * 8);
     cuCtxSynchronize();
   }
@@ -5873,10 +6099,11 @@ int main(int argc, char** argv) {
     }
   }
   bool dev = gpu != 0 && BANGS != 0 && gpu_probe();
-  if (gpu == 1 && BANGS != 0 && !dev) {
+  bool ft  = gpu != 0 && FTOPS != 0 && (dev || gpu_probe());
+  if (gpu == 1 && (BANGS != 0 || FTOPS != 0) && !(dev || ft)) {
     cli_fail("--gpu on, but this binary found no GPU device", NULL);
   }
-  Corpus H  = corpus_setup(dev, thr > 0 ? thr : cpu_count(), mem);
+  Corpus H  = corpus_setup(dev, ft, thr > 0 ? thr : cpu_count(), mem);
   int code  = io_loop(H);
   io_sync();
   return code;

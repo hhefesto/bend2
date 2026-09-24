@@ -2248,6 +2248,137 @@ def Array.map(~T: Type, ~U: Type, ~f: T -> U, a: Array<T>) -> Array<U>:
       l r = Array.map(~T, ~U, ~f, xs) Array.map(~T, ~U, ~f, ys)
       ANode{l, r}
 
+# Array.gemm
+# ----------
+
+# A matrix inside an F32 array: ArrayView{t, o, ld, s} denotes the batch of
+# matrices (b, r, c) -> x[o + b·s + r·ld + c], transposed (r and c swapped)
+# when t is not 0. ArrayView.at is that meaning, as an index.
+type ArrayView is Data:
+  ArrayView{t: U32, o: U32, ld: U32, s: U32}
+
+def ArrayView.at.if(z: Bool, +o: U32, +ld: U32, r: U32, c: U32) -> U32:
+  match z:
+    case True{}:
+      U32.add(o, U32.add(U32.mul(r, ld), c))
+    case False{}:
+      U32.add(o, U32.add(U32.mul(c, ld), r))
+
+def ArrayView.at(v: ArrayView, b: U32, r: U32, c: U32) -> U32:
+  match v:
+    case ArrayView{t, o, ld, s}:
+      ArrayView.at.if(U32.is_eq(t, 0), U32.add(o, U32.mul(b, s)), ld, r, c)
+
+def Array.gemm.mac(
+  ra: Array<F32> & F32, rb: Array<F32> & F32, acc: F32
+) -> Array<F32> & Array<F32> & F32:
+  (a, x) = ra
+  (b, y) = rb
+  (a, b, F32.add(acc, F32.mul(x, y)))
+
+def Array.gemm.step(
+  t: Array<F32> & Array<F32> & F32, ia: U32, ib: U32
+) -> Array<F32> & Array<F32> & F32:
+  (a, b, acc) = t
+  Array.gemm.mac(Array.get(F32, a, ia), Array.get(F32, b, ib), acc)
+
+# Σ_{q < k} op(A)(i, q) · op(B)(q, j), summed in order of q
+def Array.gemm.dot(
+  p: Nat, +q: U32, t: Array<F32> & Array<F32> & F32, +va: ArrayView,
+  +vb: ArrayView, +bi: U32, +i: U32, +j: U32
+) -> Array<F32> & Array<F32> & F32:
+  match p:
+    case 0n:
+      t
+    case 1n+r:
+      Array.gemm.dot(r, U32.inc(q), Array.gemm.step(t,
+        ArrayView.at(va, bi, i, q), ArrayView.at(vb, bi, q, j)),
+        va, vb, bi, i, j)
+
+# β = 0 ignores the old C, which may then hold anything (as in BLAS)
+def Array.gemm.blend(z: Bool, s: F32, beta: F32, old: F32) -> F32:
+  match z:
+    case True{}:
+      s
+    case False{}:
+      F32.add(s, F32.mul(beta, old))
+
+def Array.gemm.put(
+  r: Array<F32> & F32, +ci: U32, s: F32, +beta: F32
+) -> Array<F32>:
+  (c, old) = r
+  Array.set(F32, c, ci, Array.gemm.blend(F32.is_eq(beta, 0.0), s, beta, old))
+
+def Array.gemm.cell(
+  c: Array<F32>, d: Array<F32> & Array<F32> & F32, +ci: U32, alpha: F32,
+  beta: F32
+) -> Array<F32> & Array<F32> & Array<F32>:
+  (a, b, s) = d
+  (Array.gemm.put(Array.get(F32, c, ci), ci, F32.mul(alpha, s), beta), a, b)
+
+def Array.gemm.one(
+  t: Array<F32> & Array<F32> & Array<F32>, k: Nat, va: ArrayView,
+  vb: ArrayView, bi: U32, i: U32, j: U32, ci: U32, alpha: F32, beta: F32
+) -> Array<F32> & Array<F32> & Array<F32>:
+  (c, a, b) = t
+  Array.gemm.cell(c, Array.gemm.dot(k, 0, (a, b, 0.0), va, vb, bi, i, j),
+    ci, alpha, beta)
+
+def Array.gemm.row(
+  n: Nat, +j: U32, t: Array<F32> & Array<F32> & Array<F32>, +k: Nat,
+  +va: ArrayView, +vb: ArrayView, +vc: ArrayView, +bi: U32, +i: U32,
+  +alpha: F32, +beta: F32
+) -> Array<F32> & Array<F32> & Array<F32>:
+  match n:
+    case 0n:
+      t
+    case 1n+r:
+      Array.gemm.row(r, U32.inc(j), Array.gemm.one(t, k, va, vb, bi, i, j,
+        ArrayView.at(vc, bi, i, j), alpha, beta),
+        k, va, vb, vc, bi, i, alpha, beta)
+
+def Array.gemm.rows(
+  m: Nat, +i: U32, t: Array<F32> & Array<F32> & Array<F32>, +n: Nat,
+  +k: Nat, +va: ArrayView, +vb: ArrayView, +vc: ArrayView, +bi: U32,
+  +alpha: F32, +beta: F32
+) -> Array<F32> & Array<F32> & Array<F32>:
+  match m:
+    case 0n:
+      t
+    case 1n+r:
+      Array.gemm.rows(r, U32.inc(i),
+        Array.gemm.row(n, 0, t, k, va, vb, vc, bi, i, alpha, beta),
+        n, k, va, vb, vc, bi, alpha, beta)
+
+def Array.gemm.batch(
+  nb: Nat, +bi: U32, t: Array<F32> & Array<F32> & Array<F32>, +m: Nat,
+  +n: Nat, +k: Nat, +va: ArrayView, +vb: ArrayView, +vc: ArrayView,
+  +alpha: F32, +beta: F32
+) -> Array<F32> & Array<F32> & Array<F32>:
+  match nb:
+    case 0n:
+      t
+    case 1n+r:
+      Array.gemm.batch(r, U32.inc(bi),
+        Array.gemm.rows(m, 0, t, n, k, va, vb, vc, bi, alpha, beta),
+        m, n, k, va, vb, vc, alpha, beta)
+
+# C ← α·op(A)·op(B) + β·C for each of `batch` matrices, op(A) m×k, op(B)
+# k×n, C m×n, each read through its view (transpose flag, offset, leading
+# dimension, batch stride; C is never transposed). Every C entry is its own
+# dot product, so the order of the outer loops does not matter. Returns
+# (C, A, B). This definition is the meaning; compiled code swaps in cuBLAS
+# (CUDA builds) or a C loop, checked against it.
+def Array.gemm(
+  ta: U32, tb: U32, m: U32, n: U32, k: U32, batch: U32, alpha: F32,
+  a: Array<F32>, ao: U32, lda: U32, sa: U32,
+  b: Array<F32>, bo: U32, ldb: U32, sb: U32,
+  beta: F32, c: Array<F32>, co: U32, ldc: U32, sc: U32
+) -> Array<F32> & Array<F32> & Array<F32>:
+  Array.gemm.batch(U32.to_nat(batch), 0, (c, a, b), U32.to_nat(m),
+    U32.to_nat(n), U32.to_nat(k), ArrayView{ta, ao, lda, sa},
+    ArrayView{tb, bo, ldb, sb}, ArrayView{0, co, ldc, sc}, alpha, beta)
+
 # Map
 # ---
 
