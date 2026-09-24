@@ -251,8 +251,11 @@ function cc_find(gpu: boolean): string {
 function cli_build(bin: string, file: string): void {
   const c     = fs.readFileSync(file, "utf8");
   const mac   = process.platform === "darwin";
-  const bangs = !/^#define BANGS\s+0$/m.test(c)
-    && (mac || fs.existsSync("/usr/local/cuda/include/nvrtc.h"));
+  const cuda  = mac || fs.existsSync("/usr/local/cuda/include/nvrtc.h");
+  const bangs = !/^#define BANGS\s+0$/m.test(c) && cuda;
+  // bulk ops alone (Array.gemm, Array.einsum): a CUDA build, but no device
+  // program to embed or compile ahead
+  const ftops = !mac && !bangs && cuda && !/^#define FTOPS\s+0$/m.test(c);
   const cc    = cc_find(bangs);
   const objc  = mac && (bangs || /^#import /m.test(c))
     ? ["-x", "objective-c", "-fobjc-arc", "-fmodules"] : [];
@@ -264,7 +267,8 @@ function cli_build(bin: string, file: string): void {
     : ["-DBEND_CUDA=1", "-I/usr/local/cuda/include",
       "-L/usr/local/cuda/lib64", ...cpu, "-lcuda", "-lnvrtc"];
   const steps: [string, string[]][] = bangs
-    ? [[cc, gpu], [path.resolve(bin), ["--gpu-build"]]] : [[cc, cpu]];
+    ? [[cc, gpu], [path.resolve(bin), ["--gpu-build"]]]
+    : ftops ? [[cc, ["-DBEND_NO_SRC", ...gpu]]] : [[cc, cpu]];
   for (const [cmd, args] of steps) {
     if (child.spawnSync(cmd, args, { stdio: "inherit" }).status !== 0) {
       throw "Error: " + path.basename(cmd) + " failed to build " + bin;

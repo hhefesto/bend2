@@ -3481,11 +3481,15 @@ static lock           pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pool_wake = PTHREAD_COND_INITIALIZER;
 
 // The device program compiles from the binary's own text.
-#if BEND_METAL || BEND_CUDA
+// (a program with no bang never compiles it: -DBEND_NO_SRC leaves it out,
+// and with it the need for a C23 #embed)
+#if (BEND_METAL || BEND_CUDA) && !defined(BEND_NO_SRC)
 #pragma clang diagnostic ignored "-Wc23-extensions"
 static const char BEND_SRC[] = {
 #embed __FILE__
 , 0 };
+#elif BEND_METAL || BEND_CUDA
+static const char BEND_SRC[] = "";
 #endif
 
 #ifdef __OBJC__
