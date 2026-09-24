@@ -1903,6 +1903,8 @@ function arr_op(fl: File, k: string, el: Lay, args: Val[]): Val {
     }
     default: {
       const a = emit_alias(fl, val_own(fl, args[0])[0], "a");
+      // bulk ops may still be writing the array on the GPU
+      file_push(fl, "FT_WAIT();");
       const at = emit_hold(fl,
         [`blk_at(${a}, ${val_word(args[1])}, ${lgs})`], "at")[0];
       if (k === "array_get") {
@@ -4025,6 +4027,17 @@ INLINE Term term_word(Env e, Term w) {
   return x;
 }
 
+// Bulk ops queue on one stream and return; the host waits for them only
+// before it reads or writes array cells itself (FT_WAIT, emitted before
+// every get, set and swap, and run before a loop or a block copy).
+#if !DEVICE && BEND_CUDA
+static _Atomic bool ft_busy;
+static void ft_sync(void);
+#define FT_WAIT() do { if (ft_busy) { ft_sync(); } } while (0)
+#else
+#define FT_WAIT()
+#endif
+
 // Blk
 // ===
 
@@ -4078,6 +4091,7 @@ INLINE Term blk_keep(Env e, Loc at) {
 }
 
 OUTLINE Term blk_copy(Env e, Term a) {
+  FT_WAIT();
   Corpus H = e.mem;
   bool arr = term_tag(a) == TAG_ARR;
   Cls cls = blk_span(a);
@@ -4172,6 +4186,7 @@ INLINE Term blk_new(Env e, bool arr, Nat d, u32 lgs, u32 n, THR Term* v) {
 #if !DEVICE
 OUTLINE char* io_cstr(Env e, Term s, u64* len);
 #endif
+
 #if !DEVICE && BEND_CUDA
 static const char* gpu_path(void);
 #endif
@@ -4243,6 +4258,27 @@ static struct {
   u64      calls, loops, ecalls;
   double   ms, flop, ems;
 } FT = { .mu = PTHREAD_MUTEX_INITIALIZER, .prof = -1 };
+
+static void ft_sync(void) {
+  if (FT.state > 0) {
+    pthread_mutex_lock(&FT.mu);
+    if (cuCtxSetCurrent(FT.ctx) != CUDA_SUCCESS
+      || cuStreamSynchronize(FT.st) != CUDA_SUCCESS) {
+      err_fail("device fault");
+    }
+    ft_busy = false;
+    pthread_mutex_unlock(&FT.mu);
+  }
+}
+
+// a launch: queued, or with BEND_PROFILE finished before it is timed
+static bool ft_done(void) {
+  if (FT.prof > 0) {
+    return cuStreamSynchronize(FT.st) == CUDA_SUCCESS;
+  }
+  ft_busy = true;
+  return true;
+}
 
 static void ft_report(void) {
   fprintf(stderr, "bend profile: gemm %llu calls (%llu as loops), %.3f ms,"
@@ -4356,13 +4392,14 @@ OUTLINE Term ft_gemm(Env e, u64 ta, u64 tb, u64 m, u64 n, u64 k, u64 nb,
       (long long)(u32)sb, (void*)ft_cell(H, a, (u32)ao), 0, (int)(u32)lda,
       (long long)(u32)sa, &be, (void*)ft_cell(H, c, (u32)co), 0,
       (int)(u32)ldc, (long long)(u32)sc, (int)nb_, FT.compute, -1);
-    if (st != 0 || cuStreamSynchronize(FT.st) != CUDA_SUCCESS) {
+    if (st != 0 || !ft_done()) {
       fprintf(stderr, "bend: cuBLAS gemm failed (status %d)\n", st);
       err_fail("device fault");
     }
     pthread_mutex_unlock(&FT.mu);
   } else {
     FT.loops += 1;
+    FT_WAIT();
 #endif
     ft_gemm_loop(e, (u32)ta, (u32)tb, m_, n_, k_, nb_, al, a, (u32)ao,
       (u32)lda, (u32)sa, b, (u32)bo, (u32)ldb, (u32)sb, be, c, (u32)co,
@@ -4408,7 +4445,7 @@ typedef struct {
   u32 k;    // 0 input, 1 index, 2 const, 3 unary, 4 binary, 5 select
   u32 op;   // input/index number, or the op
   f32 c;
-  int32_t a, b, s;
+  int a, b, s;
 } FtNode;
 
 typedef struct {
@@ -4457,12 +4494,12 @@ static void ft_view(const char** p, FtView* v) {
   }
 }
 
-static int32_t ft_ex(const char** p, FtSpec* s) {
+static int ft_ex(const char** p, FtSpec* s) {
   ft_tok(p);
   if (s->nex >= FT_MAXEX) {
     err_fail("einsum: expression too large");
   }
-  int32_t     at = (int32_t)s->nex++;
+  int     at = (int)s->nex++;
   FtNode* nd = &s->ex[at];
   char    c  = **p;
   *p += 1;
@@ -4477,9 +4514,9 @@ static int32_t ft_ex(const char** p, FtSpec* s) {
     case 'b': nd->k = 4; nd->a = ft_ex(p, s); nd->b = ft_ex(p, s); break;
     case 's': {
       nd->k = 5;
-      int32_t x = ft_ex(p, s);
-      int32_t y = ft_ex(p, s);
-      int32_t z = ft_ex(p, s);
+      int x = ft_ex(p, s);
+      int y = ft_ex(p, s);
+      int z = ft_ex(p, s);
       s->ex[at].s = x;
       s->ex[at].a = y;
       s->ex[at].b = z;
@@ -4515,7 +4552,7 @@ static void ft_parse(const char* t, FtSpec* s) {
   ft_ex(&p, s);
 }
 
-static f32 ft_eval(const FtSpec* s, int32_t at, const f32* v, const u32* pt) {
+static f32 ft_eval(const FtSpec* s, int at, const f32* v, const u32* pt) {
   const FtNode* nd = &s->ex[at];
   switch (nd->k) {
     case 0: return nd->op < s->nin ? v[nd->op] : 0.0f;
@@ -4568,7 +4605,7 @@ INLINE u32 ft_vat(Corpus H, Term x, const FtView* v, const u32* p) {
 
 // the flat index f as a point over the indices of sel, the last fastest
 INLINE void ft_unflat(u64 f, const u32* n, u32 sel, u32* p) {
-  for (int32_t k = 5; k >= 0; k -= 1) {
+  for (int k = 5; k >= 0; k -= 1) {
     if (sel >> k & 1) {
       p[k] = (u32)(f % n[k]);
       f /= n[k];
@@ -4757,7 +4794,7 @@ static u64         FT_PART_N;
 static int         FT_ARCH;
 
 // the expression as CUDA, into buf (returns the length written)
-static u64 ft_cu(const FtSpec* s, int32_t at, char* buf, u64 cap) {
+static u64 ft_cu(const FtSpec* s, int at, char* buf, u64 cap) {
   const FtNode* nd = &s->ex[at];
   u64 n = 0;
 #define FT_P(...) n += (u64)snprintf(buf + n, n < cap ? cap - n : 0, __VA_ARGS__)
@@ -4987,6 +5024,7 @@ static void ft_einsum_gpu(Env e, const FtSpec* s, Term x) {
     u64 np = nout * a.nsplit;
     if (np > FT_PART_N) {
       if (FT_PART != 0) {
+        cuStreamSynchronize(FT.st);
         cuMemFree(FT_PART);
       }
       if (cuMemAlloc(&FT_PART, np * 4) != CUDA_SUCCESS) {
@@ -5006,7 +5044,7 @@ static void ft_einsum_gpu(Env e, const FtSpec* s, Term x) {
     rc = cuLaunchKernel(k->f[strat], ft_grid(strat == 1 ? nout * 32 : nout),
       1, 1, 256, 1, 1, 0, FT.st, a1, NULL);
   }
-  if (rc != CUDA_SUCCESS || cuStreamSynchronize(FT.st) != CUDA_SUCCESS) {
+  if (rc != CUDA_SUCCESS || !ft_done()) {
     fprintf(stderr, "bend: einsum kernel failed (%d): %s\n", (int)rc,
       s->extext);
     err_fail("device fault");
@@ -5041,6 +5079,7 @@ OUTLINE Term ft_einsum(Env e, Term spec, Term x) {
     pthread_mutex_unlock(&FT.mu);
   }
   if (!fast) {
+    FT_WAIT();
     ft_einsum_loop(e, s, x);
   }
   // BEND_FT_DUMP=dir writes each kernel's source there (to check offline)
