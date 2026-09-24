@@ -4859,16 +4859,27 @@ static void ft_dir(char* out, u64 cap) {
   mkdir(out, 0755);
 }
 
+// a kernel's identity: its expression's text and the shape of its loop
+static u64 ft_key(const FtSpec* s) {
+  static u64 base = 0;
+  if (base == 0) {
+    base = ft_fnv(FT_KSRC, strlen(FT_KSRC), 14695981039346656037ull);
+  }
+  u64 h = ft_fnv(s->extext, strlen(s->extext), base);
+  u64 f = ((u64)FT_ARCH << 32) | ((u64)s->nin << 16) | ((u64)s->red << 8)
+    | ((u64)(s->op & 1) << 2) | ((u64)(s->acc != 0) << 1) | (s->out.ix != 0);
+  return ft_fnv((const char*)&f, sizeof f, h);
+}
+
 static FtKern* ft_kern(const FtSpec* s) {
-  u64   len = 0;
-  char* src = ft_source(s, &len);
-  u64   key = ft_fnv(src, len, 14695981039346656037ull ^ (u64)FT_ARCH);
+  u64 key = ft_key(s);
   for (FtKern* k = FT_KERNS; k != NULL; k = k->next) {
     if (k->key == key) {
-      free(src);
       return k;
     }
   }
+  u64   len = 0;
+  char* src = ft_source(s, &len);
   char dir[1024];
   char path[1100];
   ft_dir(dir, sizeof dir);
