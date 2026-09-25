@@ -63,6 +63,7 @@ type Carb = {
   // a copy of the book whose defs carry their raised body (def_body)
   book: Bend.Book & { tlds: Record<Name, TLD> };
   bangs: Set<Name>;
+  ftops: Set<Name>;
   sites: Map<Name, number>;
   hot: Set<Name>;
   stat: Set<Name>;
@@ -125,9 +126,9 @@ type Call = {
 };
 
 type Intr = {
-  C?: string | string[];
+  C?: Gen | Gen[];
   call?: boolean;
-  JS: string;
+  JS?: string;
 };
 
 type Dom = [Bend.Quant, Name, HTerm];
@@ -304,6 +305,19 @@ const OPERATIONS: Record<string, Intr> = Object.setPrototypeOf({
     swap: "array_rmw($0, $1, () => $2)",
     size: "{$: \"Tuple\", fst: $0, snd: $0.length}",
   }).map(([k, JS]) => ["array_" + k, { call: true, JS }])),
+  // one array: base.bend's Array.mm and Array.einsum.prim (whose Es goes
+  // unread: the runtime runs its encoding)
+  array_mm: {
+    C: [(xs) => `ft_mm(e, ${xs.slice(0, 18).join(", ")})`],
+  },
+  array_einsum_prim: {
+    C: [(xs) => `(term_sink(e, ${xs[0]}), ft_einsum(e, ${xs[1]}, ${xs[2]}))`],
+  },
+  // (C, A, B): base.bend's Array.gemm, run by ft_gemm (cuBLAS or a loop)
+  array_gemm: {
+    C: [(xs) => `ft_gemm(e, ${xs.slice(0, 20).join(", ")})`,
+      (xs) => xs[7], (xs) => xs[11]],
+  },
   array_clone: {
     C:    ["$0", "blk_copy(e, $0)"],
     call: true,
@@ -320,6 +334,10 @@ const OPERATIONS: Record<string, Intr> = Object.setPrototypeOf({
     JS:   "array_rmw($0, $1, (o) => " + js + ")",
   }])),
 }, null);
+
+// The bulk F32 ops (the Ft section of the C runtime): a program that uses
+// one maps its heap to the GPU even with no bang.
+const FT_OPS = ["array_gemm", "array_mm", "array_einsum_prim"];
 
 // Optimized
 // ---------
@@ -854,8 +872,9 @@ function intr_of(c: Carb, k: Name, js = false): Intr | undefined {
   const tld = c.book.tlds[k];
   const it = tld?.$ === "Def" && tld.i === undefined && tld.b
     ? OPERATIONS[op_name(k)] : undefined;
-  return it !== undefined && (js || it.C !== undefined || it.call === true)
-    ? it : undefined;
+  // an op with no JS form runs its Bend definition on the JS lane
+  return it !== undefined && (js ? it.JS !== undefined
+    : it.C !== undefined || it.call === true) ? it : undefined;
 }
 
 // Call
@@ -1413,7 +1432,7 @@ function def_body(cb: Carb, k: Name): TLD | undefined {
 
 // The reachable defs, raised, with bang and call-site counts and each one's
 // refs, calls and flatness (no fork, no bang call, only tail self-calls).
-function carb_book(src: Bend.Book, roots: Name[]): Carb {
+function carb_book(src: Bend.Book, roots: Name[], js = false): Carb {
   book_owned(src);
   [TELES, SRCS, NODES, LAYS, CYCLES, FLATS, LOOPS, SIGS, BRWS].forEach((m) =>
     m.clear());
@@ -1422,6 +1441,7 @@ function carb_book(src: Bend.Book, roots: Name[]): Carb {
   const cb: Carb = {
     book: { ...src, tlds: Object.assign(Object.create(null), src.tlds) },
     bangs: new Set(),
+    ftops: new Set(),
     sites: new Map(),
     hot: new Set(),
     stat: new Set(),
@@ -1451,7 +1471,12 @@ function carb_book(src: Bend.Book, roots: Name[]): Carb {
         if (s.b) {
           cb.bangs.add(s.k);
         }
-        if (intr_of(cb, s.k) === undefined) {
+        if (FT_OPS.includes(op_name(s.k)) && intr_of(cb, s.k)) {
+          cb.ftops.add(s.k);
+        }
+        // the JS lane runs an op with no JS form as its definition
+        if (intr_of(cb, s.k) === undefined
+          || (js && intr_of(cb, s.k, true) === undefined)) {
           own.refs.add(s.k);
           cb.sites.set(s.k, (cb.sites.get(s.k) ?? 0) + 1);
         }
@@ -2006,6 +2031,8 @@ function arr_op(fl: File, k: string, el: Lay, args: Val[]): Val {
   if (k === "array_size") {
     return val_new([a, `(1ull << (blk_cls(${a}) - ${lgs}))`], arr_lay(W32));
   }
+  // bulk ops may still be writing the array on the GPU
+  file_push(fl, "FT_WAIT();");
   const [l, at] = emit_hold(fl, [`blk_loc(e.mem, ${a})`,
     `blk_at(${a}, ${val_word(args[1])}, ${lgs})`], "at");
   const old = arr_cells(fl, l, at, el,
@@ -2308,7 +2335,11 @@ function emit_intr(fl: File, it: Intr, x: HTerm,
   if (it.call === true && it.C === undefined) {
     return arr_op(fl, op, lay_el(fl.book, m.all[0]), args);
   }
-  const ws = args.map((v, i) => val_to(fl, v, sig_def(fl, k).lays[i]))
+  // Each argument takes its parameter's layout; an array-valued op (the
+  // fork's bulk ops) takes a record argument boxed (einsum's Es).
+  const lays = sig_def(fl, k).lays;
+  const ws = args.map((v, i) => Array.isArray(it.C) && v.ws.length > 1
+    ? val_to(fl, v, BOX) : val_to(fl, v, lays[i]))
     .map((v) => (val_own(fl, v), val_word(v)));
   if (Array.isArray(it.C)) {
     const as = ws.map((z) => emit_alias(fl, z, "a"));
@@ -2724,7 +2755,7 @@ function emit_row(fl: File, t: HTerm, ty: HTerm | null): string | null {
   }
   const m = term_spine(fl, s);
   const it = m.t.$ === "Ref" ? intr_of(fl, m.t.k) : undefined;
-  if (it === undefined || TAB_BAD.test(it.JS)) {
+  if (it === undefined || it.JS === undefined || TAB_BAD.test(it.JS)) {
     return null;
   }
   const xs = m.args.map((a) => emit_row(fl, a, null));
@@ -3039,7 +3070,8 @@ function compile_tables(fl: File, entries: Seg[]): string[] {
     `    if ((N) <= ${i}) break; ${r} = e.mem[(A) + ${i}]; \\\n`).join("");
   const last = rs.map((r, i) =>
     `    case ${i}: ${r} = (X); \\\n      break; \\\n`).join("");
-  defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`, "",
+  defs.push(`#define WL_RESW ${resw}`, `#define BANGS   ${fl.bangs.size}`,
+  `#define FTOPS   ${fl.ftops.size}`, "",
   `#define WL_BANK Term ${ws.join(", ")};`, "",
   `#define WL_LOAD(A, N) \\\n  do { \\\n${load}  } while (0);`, "",
   `#define WL_LAST(X) \\\n  switch (war) { \\\n${last}  }`, "",
@@ -3377,7 +3409,7 @@ function js_loop(fl: File, k: Name, loop: Name[]): void {
 
 export function js_lib(book: Bend.Book, roots: Name[],
   outs: Name[] | null): string {
-  const cb = carb_book(book, roots.slice());
+  const cb = carb_book(book, roots.slice(), true);
   const fl = file_new(cb, true);
   fl.tab = 0;
   for (const [k, def] of done_defs(cb)) {
@@ -3472,6 +3504,7 @@ using namespace metal;
 #elif BEND_CUDA
 #include <cuda.h>
 #include <nvrtc.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #endif
@@ -3739,11 +3772,15 @@ static lock           pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pool_wake = PTHREAD_COND_INITIALIZER;
 
 // The device program compiles from the binary's own text.
-#if BEND_METAL || BEND_CUDA
+// (a program with no bang never compiles it: -DBEND_NO_SRC leaves it out,
+// and with it the need for a C23 #embed)
+#if (BEND_METAL || BEND_CUDA) && !defined(BEND_NO_SRC)
 #pragma clang diagnostic ignored "-Wc23-extensions"
 static const char BEND_SRC[] = {
 #embed __FILE__
 , 0 };
+#elif BEND_METAL || BEND_CUDA
+static const char BEND_SRC[] = "";
 #endif
 
 #ifdef __OBJC__
@@ -4280,6 +4317,18 @@ INLINE Term term_word(Env e, Term w) {
   return x;
 }
 
+// Bulk ops queue on one stream and return; the host waits for them only
+// before it reads or writes array cells itself (FT_WAIT, emitted before
+// every get, set and swap, and run before a loop or a block copy).
+#if !DEVICE && BEND_CUDA
+static _Atomic bool ft_busy;
+static void ft_sync(void);
+#define FT_WAIT() do { if (ft_busy) { ft_sync(); } } while (0)
+#else
+#define FT_WAIT()
+#define ft_gpu false
+#endif
+
 // Blk
 // ===
 
@@ -4336,6 +4385,7 @@ INLINE void blk_free(Env e, Term t) {
 }
 
 OUTLINE Term blk_copy(Env e, Term a) {
+  FT_WAIT();
   bool arr = term_tag(a) == TAG_ARR;
   Cls cls = blk_span(a);
   BLK_ALLOC(dst, cls)
@@ -4414,6 +4464,1033 @@ INLINE Term blk_new(Env e, bool arr, Nat d, u32 lgs, u32 n, THR Term* v) {
     blk_write(H, arr, l, (u32)i, i % (1u << lgs) < n ? v[i % (1u << lgs)] : 0);
   }
   return term_blk(arr, c, l);
+}
+
+// Ft
+// ==
+
+#if !DEVICE
+OUTLINE char* io_cstr(Env e, Term s, u64* len);
+#endif
+
+#if !DEVICE && BEND_CUDA
+static const char* gpu_path(void);
+#endif
+
+// Bulk F32 ops over whole arrays. Each is a def in base.bend, and that
+// def is its meaning: Array.gemm is C ← α·op(A)·op(B) + β·C read through
+// ArrayView.at, every index wrapped into its array. ft_gemm_loop is that
+// definition in C, the same sums in the same order (fp contract is off),
+// and it runs on every lane. A CUDA build whose program uses a bulk op
+// hands a call to cuBLAS instead when its views fit: no index wraps and no
+// two C entries share a cell, so the order of the writes cannot matter.
+
+INLINE u32 ft_at(u32 t, u32 o, u32 ld, u32 s, u32 b, u32 r, u32 c) {
+  return o + b * s + (t == 0 ? r * ld + c : c * ld + r);
+}
+
+INLINE DEV u32a* ft_cell(Corpus H, Term a, u32 i) {
+  return blk_ptr(H, term_loc(a), i & (u32)((1ull << blk_cls(a)) - 1));
+}
+
+INLINE f32 ft_get(Corpus H, Term a, u32 i) {
+  return f32_unbox((u64)*ft_cell(H, a, i));
+}
+
+OUTLINE void ft_gemm_loop(Env e, u32 ta, u32 tb, u32 m, u32 n, u32 k,
+  u32 nb, f32 alpha, Term a, u32 ao, u32 lda, u32 sa, Term b, u32 bo,
+  u32 ldb, u32 sb, f32 beta, Term c, u32 co, u32 ldc, u32 sc) {
+  Corpus H = e.mem;
+  for (u32 bi = 0; bi < nb; bi += 1) {
+    for (u32 i = 0; i < m; i += 1) {
+      for (u32 j = 0; j < n; j += 1) {
+        f32 s = 0.0f;
+        for (u32 q = 0; q < k; q += 1) {
+          f32 x = ft_get(H, a, ft_at(ta, ao, lda, sa, bi, i, q));
+          f32 y = ft_get(H, b, ft_at(tb, bo, ldb, sb, bi, q, j));
+          s = s + x * y;
+        }
+        DEV u32a* p = ft_cell(H, c, ft_at(0, co, ldc, sc, bi, i, j));
+        f32 v = alpha * s;
+        if (!(beta == 0.0f)) {
+          v = v + beta * f32_unbox((u64)*p);
+        }
+        *p = (u32)f32_rewrap(v);
+      }
+    }
+  }
+}
+
+#if !DEVICE && BEND_CUDA
+
+// on when main mapped the heap to the GPU for a program with bulk ops
+static bool ft_gpu;
+
+typedef int (*FtGemmEx)(void*, int, int, int, int, int, const void*,
+  const void*, int, int, long long, const void*, int, int, long long,
+  const void*, void*, int, int, long long, int, int, int);
+
+// Any worker thread may reach a bulk op: each call takes the lock and makes
+// the primary context current on its thread.
+static struct {
+  int       state; // 0 untried, 1 ready, -1 unavailable
+  lock      mu;
+  CUcontext ctx;
+  void*     h;
+  CUstream  st;
+  int      compute;
+  FtGemmEx gemm;
+  int      prof;
+  u64      calls, loops, ecalls;
+  double   ms, flop, ems;
+} FT = { .mu = PTHREAD_MUTEX_INITIALIZER, .prof = -1 };
+
+static void ft_sync(void) {
+  if (FT.state > 0) {
+    pthread_mutex_lock(&FT.mu);
+    if (cuCtxSetCurrent(FT.ctx) != CUDA_SUCCESS
+      || cuStreamSynchronize(FT.st) != CUDA_SUCCESS) {
+      err_fail("device fault");
+    }
+    ft_busy = false;
+    pthread_mutex_unlock(&FT.mu);
+  }
+}
+
+// a launch: queued, or with BEND_PROFILE finished before it is timed
+static bool ft_done(void) {
+  if (FT.prof > 0) {
+    return cuStreamSynchronize(FT.st) == CUDA_SUCCESS;
+  }
+  ft_busy = true;
+  return true;
+}
+
+static void ft_report(void) {
+  fprintf(stderr, "bend profile: gemm %llu calls (%llu as loops), %.3f ms,"
+    " %.3f GFLOP, %.1f GFLOP/s\n", (unsigned long long)FT.calls,
+    (unsigned long long)FT.loops, FT.ms, FT.flop / 1e9,
+    FT.ms > 0 ? FT.flop / FT.ms / 1e6 : 0.0);
+  fprintf(stderr, "bend profile: einsum %llu calls, %.3f ms\n",
+    (unsigned long long)FT.ecalls, FT.ems);
+}
+
+// cuBLAS by dlopen: a build needs no cuBLAS headers, and a box without the
+// library runs the loop. BEND_CUBLAS names the library;
+// BEND_GEMM_NUMERICS is fp32 (the default), tf32 or bf16; BEND_GEMM=loop
+// keeps every call on the loop (the oracle); BEND_PROFILE=1 sums the calls
+// at exit, 2 also prints each one.
+static bool ft_open(void) {
+  if (FT.state != 0) {
+    return FT.state > 0;
+  }
+  FT.state = -1;
+  const char* g = getenv("BEND_GEMM");
+  if (g != NULL && strcmp(g, "loop") == 0) {
+    return false;
+  }
+  const char* nm = getenv("BEND_GEMM_NUMERICS");
+  FT.compute = nm == NULL || strcmp(nm, "fp32") == 0 ? 69
+    : strcmp(nm, "tf32") == 0 ? 77 : strcmp(nm, "bf16") == 0 ? 75 : 0;
+  if (FT.compute == 0) {
+    err_fail("BEND_GEMM_NUMERICS must be fp32, tf32 or bf16");
+  }
+  const char* so[] = { getenv("BEND_CUBLAS"), "libcublas.so",
+    "libcublas.so.13", "libcublas.so.12", "libcublas.so.11" };
+  void* lib = NULL;
+  for (u32 i = 0; i < 5 && lib == NULL; i += 1) {
+    lib = so[i] == NULL ? NULL : dlopen(so[i], RTLD_NOW | RTLD_GLOBAL);
+  }
+  int (*create)(void**) = lib ? (int (*)(void**))dlsym(lib,
+    "cublasCreate_v2") : NULL;
+  int (*stream)(void*, CUstream) = lib ? (int (*)(void*, CUstream))dlsym(lib,
+    "cublasSetStream_v2") : NULL;
+  FT.gemm = lib ? (FtGemmEx)dlsym(lib, "cublasGemmStridedBatchedEx") : NULL;
+  if (create == NULL || stream == NULL || FT.gemm == NULL
+    || cuDevicePrimaryCtxRetain(&FT.ctx, gpu_dev) != CUDA_SUCCESS
+    || cuCtxSetCurrent(FT.ctx) != CUDA_SUCCESS
+    || cuStreamCreate(&FT.st, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS
+    || create(&FT.h) != 0 || stream(FT.h, FT.st) != 0) {
+    fprintf(stderr, "bend: cuBLAS unavailable (%s); Array.gemm runs as a"
+      " loop on the CPU\n", lib ? "setup failed" : dlerror());
+    return false;
+  }
+  FT.state = 1;
+  return true;
+}
+
+// BEND_PROFILE, read before the first call is timed
+static int ft_prof(void) {
+  if (FT.prof < 0) {
+    const char* pr = getenv("BEND_PROFILE");
+    FT.prof = pr == NULL ? 0 : atoi(pr) > 1 ? 2 : 1;
+    if (FT.prof) {
+      atexit(ft_report);
+    }
+  }
+  return FT.prof;
+}
+
+static double ft_now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
+
+// a view's stored matrices lie inside its array, without wrapping
+static bool ft_fits(Term a, u64 rows, u64 cols, u64 o, u64 ld, u64 s,
+  u64 nb) {
+  u64 top = o + (nb - 1) * s + (rows - 1) * ld + (cols - 1);
+  return ld >= cols && ld <= 0x7FFFFFFF && top < (1ull << blk_cls(a))
+    && top < (1ull << 32);
+}
+
+#endif
+
+OUTLINE Term ft_gemm(Env e, u64 ta, u64 tb, u64 m, u64 n, u64 k, u64 nb,
+  u64 alpha, Term a, u64 ao, u64 lda, u64 sa, Term b, u64 bo, u64 ldb,
+  u64 sb, u64 beta, Term c, u64 co, u64 ldc, u64 sc) {
+  u32 m_ = (u32)m, n_ = (u32)n, k_ = (u32)k, nb_ = (u32)nb;
+  f32 al = f32_unbox(alpha), be = f32_unbox(beta);
+#if !DEVICE && BEND_CUDA
+  double t0 = ft_gpu && ft_prof() ? ft_now() : 0;
+  u32 ta_ = (u32)ta != 0, tb_ = (u32)tb != 0;
+  bool fast = ft_gpu && m_ > 0 && n_ > 0 && k_ > 0 && nb_ > 0
+    && m_ <= 0x7FFFFFFF && n_ <= 0x7FFFFFFF && k_ <= 0x7FFFFFFF
+    && ft_fits(a, ta_ ? k_ : m_, ta_ ? m_ : k_, (u32)ao, (u32)lda,
+      (u32)sa, nb_)
+    && ft_fits(b, tb_ ? n_ : k_, tb_ ? k_ : n_, (u32)bo, (u32)ldb,
+      (u32)sb, nb_)
+    && ft_fits(c, m_, n_, (u32)co, (u32)ldc, (u32)sc, nb_)
+    && (nb_ == 1 || (u64)(u32)sc >= ((u64)m_ - 1) * (u32)ldc + n_);
+  if (fast) {
+    pthread_mutex_lock(&FT.mu);
+    fast = ft_open() && cuCtxSetCurrent(FT.ctx) == CUDA_SUCCESS;
+    if (!fast) {
+      pthread_mutex_unlock(&FT.mu);
+    }
+  }
+  if (fast) {
+    Corpus H = e.mem;
+    // row-major C = op(A)·op(B) is column-major Cᵀ = op(B)ᵀ·op(A)ᵀ
+    int st = FT.gemm(FT.h, (int)tb_, (int)ta_, (int)n_, (int)m_, (int)k_,
+      &al, (void*)ft_cell(H, b, (u32)bo), 0, (int)(u32)ldb,
+      (long long)(u32)sb, (void*)ft_cell(H, a, (u32)ao), 0, (int)(u32)lda,
+      (long long)(u32)sa, &be, (void*)ft_cell(H, c, (u32)co), 0,
+      (int)(u32)ldc, (long long)(u32)sc, (int)nb_, FT.compute, -1);
+    if (st != 0 || !ft_done()) {
+      fprintf(stderr, "bend: cuBLAS gemm failed (status %d)\n", st);
+      err_fail("device fault");
+    }
+    pthread_mutex_unlock(&FT.mu);
+  } else {
+    FT.loops += 1;
+    FT_WAIT();
+#endif
+    ft_gemm_loop(e, (u32)ta, (u32)tb, m_, n_, k_, nb_, al, a, (u32)ao,
+      (u32)lda, (u32)sa, b, (u32)bo, (u32)ldb, (u32)sb, be, c, (u32)co,
+      (u32)ldc, (u32)sc);
+#if !DEVICE && BEND_CUDA
+  }
+  if (ft_gpu && FT.prof > 0) {
+    double ms = ft_now() - t0;
+    FT.calls += 1;
+    FT.ms    += ms;
+    FT.flop  += 2.0 * m_ * n_ * k_ * nb_;
+    if (FT.prof > 1) {
+      fprintf(stderr, "bend profile: gemm %s %ux%ux%u x%u %.3f ms %.1f"
+        " GFLOP/s\n", fast ? "cublas" : "loop", m_, n_, k_, nb_, ms,
+        2.0 * m_ * n_ * k_ * nb_ / ms / 1e6);
+    }
+  }
+#endif
+  return c;
+}
+
+// Einsum
+// ======
+
+// Array.einsum.prim runs an Es (base.bend) from its encoding. The loop is
+// its definition in C: the same points, in the same order, with the same
+// F32 steps (each libm call through double, as the C lane's F32 ops). A
+// CUDA build with bulk ops compiles each distinct expression into a
+// kernel (NVRTC, cached in memory and beside the binary) whose reductions
+// run in another order: equal to the definition within rounding. Both
+// read the inputs from the array they write, so an output that overlaps
+// an input is refused unless it is that input's own view, read at the
+// same point (an elementwise update in place).
+
+#define FT_MAXIN 8
+#define FT_MAXEX 512
+
+typedef struct {
+  u32 off, st[6], ix, ioff, ist[6], imul;
+} FtView;
+
+typedef struct {
+  u32 k;    // 0 input, 1 index, 2 const, 3 unary, 4 binary, 5 select
+  u32 op;   // input/index number, or the op
+  f32 c;
+  int a, b, s;
+} FtNode;
+
+typedef struct {
+  u32    n[6], red, op, acc, nin;
+  FtView out, in[FT_MAXIN];
+  FtNode ex[FT_MAXEX];
+  u32    nex;
+  const char* extext;
+} FtSpec;
+
+#if !DEVICE
+
+static const char* ft_tok(const char** p) {
+  while (**p == ' ') {
+    *p += 1;
+  }
+  return *p;
+}
+
+static u32 ft_num(const char** p) {
+  ft_tok(p);
+  u64 v = 0;
+  while (**p >= '0' && **p <= '9') {
+    v = v * 10 + (u64)(**p - '0');
+    *p += 1;
+  }
+  return (u32)v;
+}
+
+static void ft_view(const char** p, FtView* v) {
+  v->off = ft_num(p);
+  for (u32 k = 0; k < 6; k += 1) {
+    v->st[k] = ft_num(p);
+  }
+  v->ix = ft_num(p);
+  v->ioff = v->imul = 0;
+  for (u32 k = 0; k < 6; k += 1) {
+    v->ist[k] = 0;
+  }
+  if (v->ix) {
+    v->ioff = ft_num(p);
+    for (u32 k = 0; k < 6; k += 1) {
+      v->ist[k] = ft_num(p);
+    }
+    v->imul = ft_num(p);
+  }
+}
+
+static int ft_ex(const char** p, FtSpec* s) {
+  ft_tok(p);
+  if (s->nex >= FT_MAXEX) {
+    err_fail("einsum: expression too large");
+  }
+  int     at = (int)s->nex++;
+  FtNode* nd = &s->ex[at];
+  char    c  = **p;
+  *p += 1;
+  nd->a = nd->b = nd->s = -1;
+  nd->c = 0.0f;
+  nd->op = ft_num(p);
+  switch (c) {
+    case 'i': nd->k = 0; break;
+    case 'p': nd->k = 1; break;
+    case 'k': nd->k = 2; nd->c = f32_unbox(nd->op); break;
+    case 'u': nd->k = 3; nd->a = ft_ex(p, s); break;
+    case 'b': nd->k = 4; nd->a = ft_ex(p, s); nd->b = ft_ex(p, s); break;
+    case 's': {
+      nd->k = 5;
+      int x = ft_ex(p, s);
+      int y = ft_ex(p, s);
+      int z = ft_ex(p, s);
+      s->ex[at].s = x;
+      s->ex[at].a = y;
+      s->ex[at].b = z;
+      break;
+    }
+    default: err_fail("einsum: bad expression");
+  }
+  return at;
+}
+
+static void ft_parse(const char* t, FtSpec* s) {
+  const char* p = t;
+  if (*ft_tok(&p) != 'E') {
+    err_fail("einsum: bad spec");
+  }
+  p += 1;
+  for (u32 k = 0; k < 6; k += 1) {
+    s->n[k] = ft_num(&p);
+  }
+  s->red = ft_num(&p) & 63;
+  s->op  = ft_num(&p);
+  s->acc = ft_num(&p);
+  ft_view(&p, &s->out);
+  s->nin = ft_num(&p);
+  if (s->nin > FT_MAXIN) {
+    err_fail("einsum: too many inputs");
+  }
+  for (u32 i = 0; i < s->nin; i += 1) {
+    ft_view(&p, &s->in[i]);
+  }
+  s->nex = 0;
+  s->extext = ft_tok(&p);
+  ft_ex(&p, s);
+}
+
+static f32 ft_eval(const FtSpec* s, int at, const f32* v, const u32* pt) {
+  const FtNode* nd = &s->ex[at];
+  switch (nd->k) {
+    case 0: return nd->op < s->nin ? v[nd->op] : 0.0f;
+    case 1: return (f32)(nd->op < 6 ? pt[nd->op] : 0);
+    case 2: return nd->c;
+    case 3: {
+      f32 x = ft_eval(s, nd->a, v, pt);
+      switch (nd->op) {
+        case 0: return -x;
+        case 1: return (f32)exp(x);
+        case 2: return (f32)log(x);
+        case 3: return (f32)sqrt(x);
+        default: return (f32)fabs(x);
+      }
+    }
+    case 4: {
+      f32 a = ft_eval(s, nd->a, v, pt);
+      f32 b = ft_eval(s, nd->b, v, pt);
+      switch (nd->op) {
+        case 0: return a + b;
+        case 1: return a - b;
+        case 2: return a * b;
+        case 3: return a / b;
+        case 4: return a > b ? a : b;
+        case 5: return a < b ? a : b;
+        case 6: return a < b ? 1.0f : 0.0f;
+        default: return a <= b ? 1.0f : 0.0f;
+      }
+    }
+    default:
+      return ft_eval(s, nd->s, v, pt) != 0.0f ? ft_eval(s, nd->a, v, pt)
+        : ft_eval(s, nd->b, v, pt);
+  }
+}
+
+INLINE u32 ft_vat(Corpus H, Term x, const FtView* v, const u32* p) {
+  u32 a = v->off;
+  for (u32 k = 0; k < 6; k += 1) {
+    a += v->st[k] * p[k];
+  }
+  if (v->ix) {
+    u32 i = v->ioff;
+    for (u32 k = 0; k < 6; k += 1) {
+      i += v->ist[k] * p[k];
+    }
+    a += v->imul * (u32)f32_to_u32((u64)*ft_cell(H, x, i));
+  }
+  return a;
+}
+
+// the flat index f as a point over the indices of sel, the last fastest
+INLINE void ft_unflat(u64 f, const u32* n, u32 sel, u32* p) {
+  for (int k = 5; k >= 0; k -= 1) {
+    if (sel >> k & 1) {
+      p[k] = (u32)(f % n[k]);
+      f /= n[k];
+    }
+  }
+}
+
+static u64 ft_count(const u32* n, u32 sel) {
+  u64 c = 1;
+  for (u32 k = 0; k < 6; k += 1) {
+    if (sel >> k & 1) {
+      c *= n[k];
+    }
+  }
+  return c;
+}
+
+static void ft_einsum_loop(Env e, const FtSpec* s, Term x) {
+  Corpus H    = e.mem;
+  u32    unr  = 63 & ~s->red;
+  u64    nout = ft_count(s->n, unr);
+  u64    nred = ft_count(s->n, s->red);
+  f32    v[FT_MAXIN];
+  for (u64 o = 0; o < nout; o += 1) {
+    u32 p[6] = {0, 0, 0, 0, 0, 0};
+    ft_unflat(o, s->n, unr, p);
+    f32 r = s->op == 0 ? 0.0f : -INFINITY;
+    for (u64 q = 0; q < nred; q += 1) {
+      ft_unflat(q, s->n, s->red, p);
+      for (u32 i = 0; i < s->nin; i += 1) {
+        v[i] = ft_get(H, x, ft_vat(H, x, &s->in[i], p));
+      }
+      f32 t = ft_eval(s, 0, v, p);
+      r = s->op == 0 ? r + t : t > r ? t : r;
+    }
+    for (u32 k = 0; k < 6; k += 1) {
+      if (s->red >> k & 1) {
+        p[k] = 0;
+      }
+    }
+    DEV u32a* c = ft_cell(H, x, ft_vat(H, x, &s->out, p));
+    f32 w = s->acc ? f32_unbox((u64)*c) + r : r;
+    *c = (u32)f32_rewrap(w);
+  }
+}
+
+// the lowest and highest index a direct view reaches (no wrap assumed)
+static void ft_span(const FtView* v, const u32* n, u32 sel, u64* lo, u64* hi) {
+  *lo = v->off;
+  *hi = v->off;
+  for (u32 k = 0; k < 6; k += 1) {
+    if (sel >> k & 1 && n[k] > 0) {
+      *hi += (u64)v->st[k] * (n[k] - 1);
+    }
+  }
+}
+
+static bool ft_same(const FtView* a, const FtView* b) {
+  return !a->ix && !b->ix && a->off == b->off
+    && memcmp(a->st, b->st, sizeof a->st) == 0;
+}
+
+// refuse an output that overlaps what the op reads, but for an input
+// read at the very cell it writes
+static void ft_check(const FtSpec* s) {
+  if (s->out.ix) {
+    return;
+  }
+  u64 olo, ohi;
+  ft_span(&s->out, s->n, 63 & ~s->red, &olo, &ohi);
+  for (u32 i = 0; i < s->nin; i += 1) {
+    const FtView* v = &s->in[i];
+    u64 lo, hi;
+    if (v->ix) {
+      FtView iv = { v->ioff, { 0 }, 0, 0, { 0 }, 0 };
+      memcpy(iv.st, v->ist, sizeof iv.st);
+      ft_span(&iv, s->n, 63, &lo, &hi);
+      if (lo <= ohi && olo <= hi) {
+        err_fail("einsum: the output overlaps an index view");
+      }
+      continue;
+    }
+    ft_span(v, s->n, 63, &lo, &hi);
+    if (lo <= ohi && olo <= hi && !(ft_same(v, &s->out) && s->red == 0)) {
+      err_fail("einsum: the output overlaps an input");
+    }
+  }
+}
+
+#endif
+
+#if !DEVICE && BEND_CUDA
+
+// Kernels: one source per (expression, input count, reduced indices, op,
+// acc, indirect output, strategy); sizes, offsets and strides are
+// arguments. Strategies: 0 a thread per output (serial reduction), 1 a
+// warp per output, 2 blocks over slices of each output's reduction, then a
+// thread per output over the slices.
+
+static const char* FT_KSRC = "typedef unsigned int u32;\n"
+"struct V { u32 off; u32 st[6]; u32 ix; u32 ioff; u32 ist[6]; u32 imul; };\n"
+"struct A { u32 n[6]; u32 nout; u32 nred; u32 m; u32 nsplit; V o; V in[NIN > 0 ? NIN : 1]; };\n"
+"__device__ __forceinline__ u32 f2u(float v) { return v >= 0.0f && v < 4294967296.0f ? (u32)v : 0u; }\n"
+"__device__ __forceinline__ float fmx(float a, float b) { return a > b ? a : b; }\n"
+"__device__ __forceinline__ float fmn(float a, float b) { return a < b ? a : b; }\n"
+"__device__ __forceinline__ float flt(float a, float b) { return a < b ? 1.0f : 0.0f; }\n"
+"__device__ __forceinline__ float fle(float a, float b) { return a <= b ? 1.0f : 0.0f; }\n"
+"__device__ __forceinline__ u32 at(const float* S, const V& v, const u32* p, u32 m) {\n"
+"  u32 a = v.off;\n"
+"  _Pragma(\"unroll\") for (int k = 0; k < 6; k++) a += v.st[k] * p[k];\n"
+"  if (v.ix) { u32 i = v.ioff;\n"
+"    _Pragma(\"unroll\") for (int k = 0; k < 6; k++) i += v.ist[k] * p[k];\n"
+"    a += v.imul * f2u(S[i & m]); }\n"
+"  return a & m;\n"
+"}\n"
+"__device__ __forceinline__ void unflat(u32 f, const u32* n, u32 sel, u32* p) {\n"
+"  _Pragma(\"unroll\") for (int k = 5; k >= 0; k--) if (sel >> k & 1) { p[k] = f % n[k]; f /= n[k]; }\n"
+"}\n"
+"__device__ __forceinline__ float comb(float r, float t) { return OP == 0 ? r + t : (t > r ? t : r); }\n"
+"__device__ __forceinline__ float term(const float* S, const A& a, const u32* p) {\n"
+"LOADS  return EXPR;\n"
+"}\n"
+"__device__ __forceinline__ void put(float* S, const A& a, u32* p, float r) {\n"
+"  _Pragma(\"unroll\") for (int k = 0; k < 6; k++) if (RED >> k & 1) p[k] = 0;\n"
+"  u32 o = at(S, a.o, p, a.m);\n"
+"  if (ACC && OIX) atomicAdd(&S[o], r); else if (ACC) S[o] = S[o] + r; else S[o] = r;\n"
+"}\n"
+"#define INIT (OP == 0 ? 0.0f : -__int_as_float(0x7f800000))\n"
+"extern \"C\" __global__ void k0(float* S, A a) {\n"
+"  for (u32 o = blockIdx.x * blockDim.x + threadIdx.x; o < a.nout; o += gridDim.x * blockDim.x) {\n"
+"    u32 p[6] = {0, 0, 0, 0, 0, 0}; unflat(o, a.n, 63 & ~RED, p);\n"
+"    float r = INIT;\n"
+"    for (u32 q = 0; q < a.nred; q++) { unflat(q, a.n, RED, p); r = comb(r, term(S, a, p)); }\n"
+"    put(S, a, p, r);\n"
+"  }\n"
+"}\n"
+"extern \"C\" __global__ void k1(float* S, A a) {\n"
+"  u32 lane = threadIdx.x & 31, w = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, nw = (gridDim.x * blockDim.x) >> 5;\n"
+"  for (u32 o = w; o < a.nout; o += nw) {\n"
+"    u32 p[6] = {0, 0, 0, 0, 0, 0}; unflat(o, a.n, 63 & ~RED, p);\n"
+"    float r = INIT;\n"
+"    for (u32 q = lane; q < a.nred; q += 32) { unflat(q, a.n, RED, p); r = comb(r, term(S, a, p)); }\n"
+"    _Pragma(\"unroll\") for (int s = 16; s > 0; s >>= 1) r = comb(r, __shfl_down_sync(0xffffffffu, r, s));\n"
+"    if (lane == 0) put(S, a, p, r);\n"
+"  }\n"
+"}\n"
+"extern \"C\" __global__ void k2(float* S, float* part, A a) {\n"
+"  __shared__ float sh[32];\n"
+"  u32 o = blockIdx.x / a.nsplit, sl = blockIdx.x % a.nsplit;\n"
+"  u32 chunk = (a.nred + a.nsplit - 1) / a.nsplit, lo = sl * chunk, hi = min(a.nred, lo + chunk);\n"
+"  u32 p[6] = {0, 0, 0, 0, 0, 0}; unflat(o, a.n, 63 & ~RED, p);\n"
+"  float r = INIT;\n"
+"  for (u32 q = lo + threadIdx.x; q < hi; q += blockDim.x) { unflat(q, a.n, RED, p); r = comb(r, term(S, a, p)); }\n"
+"  _Pragma(\"unroll\") for (int s = 16; s > 0; s >>= 1) r = comb(r, __shfl_down_sync(0xffffffffu, r, s));\n"
+"  if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = r;\n"
+"  __syncthreads();\n"
+"  if (threadIdx.x < 32) {\n"
+"    r = threadIdx.x < (blockDim.x >> 5) ? sh[threadIdx.x] : INIT;\n"
+"    _Pragma(\"unroll\") for (int s = 16; s > 0; s >>= 1) r = comb(r, __shfl_down_sync(0xffffffffu, r, s));\n"
+"    if (threadIdx.x == 0) part[blockIdx.x] = r;\n"
+"  }\n"
+"}\n"
+"extern \"C\" __global__ void k3(float* S, const float* part, A a) {\n"
+"  for (u32 o = blockIdx.x * blockDim.x + threadIdx.x; o < a.nout; o += gridDim.x * blockDim.x) {\n"
+"    u32 p[6] = {0, 0, 0, 0, 0, 0}; unflat(o, a.n, 63 & ~RED, p);\n"
+"    float r = INIT;\n"
+"    for (u32 sl = 0; sl < a.nsplit; sl++) r = comb(r, part[o * a.nsplit + sl]);\n"
+"    put(S, a, p, r);\n"
+"  }\n"
+"}\n";
+
+typedef struct {
+  u32    n[6], nout, nred, m, nsplit;
+  FtView o, in[FT_MAXIN];
+} FtArgs;
+
+typedef struct FtKern {
+  u64            key;
+  CUfunction     f[4];
+  struct FtKern* next;
+} FtKern;
+
+static FtKern*     FT_KERNS;
+static CUdeviceptr FT_PART;
+static u64         FT_PART_N;
+static int         FT_ARCH;
+
+// the expression as CUDA, into buf (returns the length written)
+static u64 ft_cu(const FtSpec* s, int at, char* buf, u64 cap) {
+  const FtNode* nd = &s->ex[at];
+  u64 n = 0;
+#define FT_P(...) n += (u64)snprintf(buf + n, n < cap ? cap - n : 0, __VA_ARGS__)
+#define FT_E(i) n += ft_cu(s, (i), buf + (n < cap ? n : cap), n < cap ? cap - n : 0)
+  switch (nd->k) {
+    case 0: FT_P("x%u", nd->op); break;
+    case 1: FT_P("((float)p[%u])", nd->op < 6 ? nd->op : 0); break;
+    case 2: FT_P("__int_as_float(0x%08x)", (u32)f32_rewrap(nd->c)); break;
+    case 3: {
+      static const char* un[] = { "(-", "expf(", "logf(", "sqrtf(", "fabsf(" };
+      FT_P("%s", un[nd->op < 5 ? nd->op : 4]);
+      FT_E(nd->a);
+      FT_P(")");
+      break;
+    }
+    case 4: {
+      static const char* in[] = { "+", "-", "*", "/" };
+      static const char* fn[] = { "fmx(", "fmn(", "flt(", "fle(" };
+      if (nd->op < 4) {
+        FT_P("(");
+        FT_E(nd->a);
+        FT_P(" %s ", in[nd->op]);
+        FT_E(nd->b);
+        FT_P(")");
+      } else {
+        FT_P("%s", fn[nd->op < 8 ? nd->op - 4 : 3]);
+        FT_E(nd->a);
+        FT_P(", ");
+        FT_E(nd->b);
+        FT_P(")");
+      }
+      break;
+    }
+    default:
+      FT_P("(");
+      FT_E(nd->s);
+      FT_P(" != 0.0f ? ");
+      FT_E(nd->a);
+      FT_P(" : ");
+      FT_E(nd->b);
+      FT_P(")");
+  }
+#undef FT_P
+#undef FT_E
+  return n;
+}
+
+static u64 ft_fnv(const char* p, u64 n, u64 h) {
+  for (u64 i = 0; i < n; i += 1) {
+    h = (h ^ (u8)p[i]) * 1099511628211ull;
+  }
+  return h;
+}
+
+static char* ft_source(const FtSpec* s, u64* len) {
+  u64   cap = 1 << 16;
+  char* src = malloc(cap);
+  char* ex  = malloc(cap);
+  if (src == NULL || ex == NULL) {
+    err_fail("out of memory");
+  }
+  u64 ne = ft_cu(s, 0, ex, cap);
+  if (ne >= cap) {
+    err_fail("einsum: expression too large");
+  }
+  char loads[FT_MAXIN * 48 + 1] = { 0 };
+  u64  nl = 0;
+  for (u32 i = 0; i < s->nin; i += 1) {
+    nl += (u64)snprintf(loads + nl, sizeof loads - nl,
+      "  float x%u = S[at(S, a.in[%u], p, a.m)];\n", i, i);
+  }
+  u64 n = (u64)snprintf(src, cap, "#define NIN %u\n#define RED %uu\n"
+    "#define OP %u\n#define ACC %u\n#define OIX %u\n#define EXPR %s\n",
+    s->nin, s->red, s->op, s->acc != 0, s->out.ix != 0, ex);
+  // LOADS goes in literally: splice it where the template names it
+  const char* mark = "LOADS";
+  const char* t    = strstr(FT_KSRC, mark);
+  n += (u64)snprintf(src + n, cap - n, "%.*s%s%s", (int)(t - FT_KSRC),
+    FT_KSRC, loads, t + strlen(mark));
+  free(ex);
+  if (n >= cap) {
+    err_fail("einsum: kernel source too large");
+  }
+  *len = n;
+  return src;
+}
+
+static void ft_dir(char* out, u64 cap) {
+  const char* d = getenv("BEND_FT_CACHE");
+  if (d != NULL) {
+    snprintf(out, cap, "%s", d);
+  } else {
+    snprintf(out, cap, "%s", gpu_path());
+    char* dot = strrchr(out, '.');
+    if (dot != NULL) {
+      snprintf(dot, cap - (u64)(dot - out), ".ftk");
+    }
+  }
+  mkdir(out, 0755);
+}
+
+// a kernel's identity: its expression's text and the shape of its loop
+static u64 ft_key(const FtSpec* s) {
+  static u64 base = 0;
+  if (base == 0) {
+    base = ft_fnv(FT_KSRC, strlen(FT_KSRC), 14695981039346656037ull);
+  }
+  u64 h = ft_fnv(s->extext, strlen(s->extext), base);
+  u64 f = ((u64)FT_ARCH << 32) | ((u64)s->nin << 16) | ((u64)s->red << 8)
+    | ((u64)(s->op & 1) << 2) | ((u64)(s->acc != 0) << 1) | (s->out.ix != 0);
+  return ft_fnv((const char*)&f, sizeof f, h);
+}
+
+static FtKern* ft_kern(const FtSpec* s) {
+  u64 key = ft_key(s);
+  for (FtKern* k = FT_KERNS; k != NULL; k = k->next) {
+    if (k->key == key) {
+      return k;
+    }
+  }
+  u64   len = 0;
+  char* src = ft_source(s, &len);
+  char dir[1024];
+  char path[1100];
+  ft_dir(dir, sizeof dir);
+  snprintf(path, sizeof path, "%s/%016llx.cubin", dir, (unsigned long long)key);
+  CUmodule mod = NULL;
+  FILE*    f   = fopen(path, "rb");
+  if (f != NULL) {
+    fseek(f, 0, SEEK_END);
+    long  sz  = ftell(f);
+    char* bin = sz > 0 ? malloc((u64)sz) : NULL;
+    fseek(f, 0, SEEK_SET);
+    if (bin == NULL || fread(bin, 1, (u64)sz, f) != (u64)sz
+      || cuModuleLoadData(&mod, bin) != CUDA_SUCCESS) {
+      mod = NULL;
+    }
+    free(bin);
+    fclose(f);
+  }
+  if (mod == NULL) {
+    char arch[40];
+    snprintf(arch, sizeof arch, "--gpu-architecture=sm_%d", FT_ARCH);
+    const char*  opts[] = { arch, "--fmad=false", "-std=c++14" };
+    nvrtcProgram prog;
+    if (nvrtcCreateProgram(&prog, src, "ft.cu", 0, NULL, NULL)
+      != NVRTC_SUCCESS) {
+      err_fail("einsum: cannot create the kernel program");
+    }
+    if (nvrtcCompileProgram(prog, 3, opts) != NVRTC_SUCCESS) {
+      size_t n = 0;
+      nvrtcGetProgramLogSize(prog, &n);
+      char* log = calloc(n + 1, 1);
+      if (log != NULL && nvrtcGetProgramLog(prog, log) == NVRTC_SUCCESS) {
+        fprintf(stderr, "%s\n%s\n", src, log);
+      }
+      err_fail("einsum: cannot compile a kernel");
+    }
+    size_t bl = 0;
+    nvrtcGetCUBINSize(prog, &bl);
+    char* bin = malloc(bl);
+    if (bin == NULL || nvrtcGetCUBIN(prog, bin) != NVRTC_SUCCESS
+      || cuModuleLoadData(&mod, bin) != CUDA_SUCCESS) {
+      err_fail("einsum: cannot load a kernel");
+    }
+    nvrtcDestroyProgram(&prog);
+    f = fopen(path, "wb");
+    if (f != NULL) {
+      fwrite(bin, 1, bl, f);
+      fclose(f);
+    }
+    free(bin);
+  }
+  free(src);
+  FtKern* k = calloc(1, sizeof *k);
+  if (k == NULL) {
+    err_fail("out of memory");
+  }
+  k->key = key;
+  const char* names[] = { "k0", "k1", "k2", "k3" };
+  for (u32 i = 0; i < 4; i += 1) {
+    if (cuModuleGetFunction(&k->f[i], mod, names[i]) != CUDA_SUCCESS) {
+      err_fail("einsum: a kernel is missing");
+    }
+  }
+  k->next  = FT_KERNS;
+  FT_KERNS = k;
+  return k;
+}
+
+// Strategy tuning: each (kernel, shape) tries its candidate strategies on
+// its first occurrences, each timed alone, then keeps the fastest. Every
+// strategy computes the same sum, so the choice is invisible but for
+// rounding.
+typedef struct FtTune {
+  u64            key;
+  u32            nout, nred, ncand, tried;
+  int            cand[3], best;
+  double         t[3];
+  struct FtTune* next;
+} FtTune;
+
+static FtTune* FT_TUNES;
+
+static FtTune* ft_tune(u64 key, u64 nout, u64 nred) {
+  for (FtTune* t = FT_TUNES; t != NULL; t = t->next) {
+    if (t->key == key && t->nout == nout && t->nred == nred) {
+      return t;
+    }
+  }
+  FtTune* t = calloc(1, sizeof *t);
+  if (t == NULL) {
+    err_fail("out of memory");
+  }
+  t->key  = key;
+  t->nout = (u32)nout;
+  t->nred = (u32)nred;
+  t->best = -1;
+  if (nred <= 1) {
+    t->cand[0] = 0;
+    t->ncand   = 1;
+  } else if (nout >= 1024) {
+    t->cand[0] = 0;
+    t->cand[1] = 1;
+    t->ncand   = 2;
+  } else {
+    t->cand[0] = 1;
+    t->cand[1] = 2;
+    t->ncand   = 2;
+  }
+  if (t->ncand == 1) {
+    t->best = t->cand[0];
+  }
+  t->next  = FT_TUNES;
+  FT_TUNES = t;
+  return t;
+}
+
+static u32 ft_grid(u64 threads) {
+  u64 b = (threads + 255) / 256;
+  return (u32)(b < 1 ? 1 : b > (1u << 20) ? (1u << 20) : b);
+}
+
+static void ft_einsum_gpu(Env e, const FtSpec* s, Term x) {
+  if (FT_ARCH == 0) {
+    int cc[2] = { 0, 0 };
+    cuDeviceGetAttribute(cc, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+      gpu_dev);
+    cuDeviceGetAttribute(cc + 1, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+      gpu_dev);
+    FT_ARCH = cc[0] * 10 + cc[1];
+  }
+  FtKern*  k = ft_kern(s);
+  FtArgs   a;
+  u32      unr  = 63 & ~s->red;
+  u64      nout = ft_count(s->n, unr);
+  u64      nred = ft_count(s->n, s->red);
+  if (nout > 0xFFFFFFFFull || nred > 0xFFFFFFFFull) {
+    err_fail("einsum: more than 2^32 points");
+  }
+  memcpy(a.n, s->n, sizeof a.n);
+  a.nout = (u32)nout;
+  a.nred = (u32)nred;
+  a.m    = (u32)((1ull << blk_cls(x)) - 1);
+  a.o    = s->out;
+  memcpy(a.in, s->in, sizeof a.in);
+  CUdeviceptr S = (CUdeviceptr)(uintptr_t)ft_cell(e.mem, x, 0);
+  const char* st   = getenv("BEND_FT_STRAT");
+  FtTune*     tu   = st != NULL ? NULL : ft_tune(k->key, nout, nred);
+  bool        trial = tu != NULL && tu->best < 0;
+  u32 strat = st != NULL ? (u32)atoi(st)
+    : trial ? (u32)tu->cand[tu->tried] : (u32)tu->best;
+  double t0 = 0;
+  if (trial) {
+    cuStreamSynchronize(FT.st);
+    t0 = ft_now();
+  }
+  CUresult rc;
+  if (strat == 2) {
+    u64 want = (nred + 16383) / 16384;
+    a.nsplit = (u32)(want < 1 ? 1 : want > 1024 ? 1024 : want);
+    u64 np = nout * a.nsplit;
+    if (np > FT_PART_N) {
+      if (FT_PART != 0) {
+        cuStreamSynchronize(FT.st);
+        cuMemFree(FT_PART);
+      }
+      if (cuMemAlloc(&FT_PART, np * 4) != CUDA_SUCCESS) {
+        err_fail("einsum: cannot allocate partials");
+      }
+      FT_PART_N = np;
+    }
+    void* a2[] = { &S, &FT_PART, &a };
+    rc = cuLaunchKernel(k->f[2], (u32)np, 1, 1, 256, 1, 1, 0, FT.st, a2, NULL);
+    if (rc == CUDA_SUCCESS) {
+      rc = cuLaunchKernel(k->f[3], ft_grid(nout), 1, 1, 256, 1, 1, 0, FT.st,
+        a2, NULL);
+    }
+  } else {
+    a.nsplit = 1;
+    void* a1[] = { &S, &a };
+    rc = cuLaunchKernel(k->f[strat], ft_grid(strat == 1 ? nout * 32 : nout),
+      1, 1, 256, 1, 1, 0, FT.st, a1, NULL);
+  }
+  if (rc != CUDA_SUCCESS || !ft_done()) {
+    fprintf(stderr, "bend: einsum kernel failed (%d): %s\n", (int)rc,
+      s->extext);
+    err_fail("device fault");
+  }
+  if (trial) {
+    cuStreamSynchronize(FT.st);
+    tu->t[tu->tried] = ft_now() - t0;
+    tu->tried += 1;
+    if (tu->tried == tu->ncand) {
+      u32 b = 0;
+      for (u32 i = 1; i < tu->ncand; i += 1) {
+        b = tu->t[i] < tu->t[b] ? i : b;
+      }
+      tu->best = tu->cand[b];
+    }
+  }
+}
+
+#endif
+
+OUTLINE Term ft_einsum(Env e, Term spec, Term x) {
+#if DEVICE
+  term_sink(e, spec);
+  err_post(e.mem, ERR_TAGS);
+  return x;
+#else
+  u64    n = 0;
+  char*  t = io_cstr(e, spec, &n);
+  FtSpec* s = malloc(sizeof(FtSpec));
+  if (s == NULL) {
+    err_fail("out of memory");
+  }
+  ft_parse(t, s);
+  ft_check(s);
+#if BEND_CUDA
+  double t0 = ft_gpu && ft_prof() ? ft_now() : 0;
+  bool   fast = false;
+  if (ft_gpu) {
+    pthread_mutex_lock(&FT.mu);
+    fast = ft_open() && cuCtxSetCurrent(FT.ctx) == CUDA_SUCCESS;
+    if (fast) {
+      ft_einsum_gpu(e, s, x);
+    }
+    pthread_mutex_unlock(&FT.mu);
+  }
+  if (!fast) {
+    FT_WAIT();
+    ft_einsum_loop(e, s, x);
+  }
+  // BEND_FT_DUMP=dir writes each kernel's source there (to check offline)
+  const char* dump = getenv("BEND_FT_DUMP");
+  if (dump != NULL) {
+    u64   len = 0;
+    char* src = ft_source(s, &len);
+    char  path[1100];
+    snprintf(path, sizeof path, "%s/%016llx.cu", dump,
+      (unsigned long long)ft_fnv(src, len, 14695981039346656037ull));
+    FILE* f = fopen(path, "w");
+    if (f != NULL) {
+      fwrite(src, 1, len, f);
+      fclose(f);
+    }
+    free(src);
+  }
+  if (ft_gpu && FT.prof > 0) {
+    double ms = ft_now() - t0;
+    FT.ecalls += 1;
+    FT.ems    += ms;
+    if (FT.prof > 1) {
+      fprintf(stderr, "bend profile: einsum %s %.3f ms %.60s\n",
+        fast ? "kernel" : "loop", ms, s->extext);
+    }
+  }
+#else
+  ft_einsum_loop(e, s, x);
+#endif
+  free(s);
+  free(t);
+  return x;
+#endif
+}
+
+// Array.mm: the gemm with A, B and C in one array
+OUTLINE Term ft_mm(Env e, u64 ta, u64 tb, u64 m, u64 n, u64 k, u64 nb,
+  u64 alpha, u64 ao, u64 lda, u64 sa, u64 bo, u64 ldb, u64 sb, u64 beta,
+  u64 co, u64 ldc, u64 sc, Term x) {
+#if !DEVICE
+  // C's rectangle against A's and B's (no wrap assumed)
+  u64 cm = (u32)m, cn = (u32)n, ck = (u32)k, cb = (u32)nb;
+  if (cm > 0 && cn > 0 && ck > 0 && cb > 0) {
+    u64 clo = (u32)co, chi = clo + (cb - 1) * (u32)sc + (cm - 1) * (u32)ldc
+      + cn - 1;
+    u64 ar = (u32)ta ? ck : cm, ac = (u32)ta ? cm : ck;
+    u64 br = (u32)tb ? cn : ck, bc = (u32)tb ? ck : cn;
+    u64 alo = (u32)ao, ahi = alo + (cb - 1) * (u32)sa + (ar - 1) * (u32)lda
+      + ac - 1;
+    u64 blo = (u32)bo, bhi = blo + (cb - 1) * (u32)sb + (br - 1) * (u32)ldb
+      + bc - 1;
+    if ((alo <= chi && clo <= ahi) || (blo <= chi && clo <= bhi)) {
+      err_fail("Array.mm: C overlaps A or B");
+    }
+  }
+#endif
+  return ft_gemm(e, ta, tb, m, n, k, nb, alpha, x, ao, lda, sa, x, bo, ldb,
+    sb, beta, x, co, ldc, sc);
 }
 
 // Ring
@@ -5392,7 +6469,7 @@ static bool corpus_grow(Corpus H, u64 need) {
   while (ok && need > a32_load(a32_at(H, H_CAP))) {
     u64   more = corpus_size;
     char* at   = (char*)H + more;
-    void* got  = io_gpu || more >= 1ull << 43 ? MAP_FAILED
+    void* got  = io_gpu || ft_gpu || more >= 1ull << 43 ? MAP_FAILED
       : pool_try(at, more);
     ok = got == at;
     if (ok) {
@@ -5405,15 +6482,20 @@ static bool corpus_grow(Corpus H, u64 need) {
   return ok;
 }
 
-static Corpus corpus_setup(bool gpu, long threads, u64 bytes) {
+// ft: the program has bulk ops and a GPU: the heap is managed memory, so
+// cuBLAS and the kernels read arrays where they lie, while the rest of the
+// program runs on the CPU threads as before (that span never grows).
+static Corpus corpus_setup(bool gpu, bool ft, long threads, u64 bytes) {
   io_gpu     = gpu;
   KEEP_WORDS = gpu ? CHUNK : CAP_WORDS;
-  u64 dflt   = gpu ? gpu_span() : 1ull << 33;
-  u64 size   = (gpu && bytes != 0 ? bytes : dflt) & ~16383ull;
-  CORPUS     = gpu ? gpu_map(size) : corpus_map(size);
+  bool map   = gpu || ft;
+  u64 dflt   = map ? gpu_span() : 1ull << 33;
+  u64 size   = (map && bytes != 0 ? bytes : dflt) & ~16383ull;
+  CORPUS     = map ? gpu_map(size) : corpus_map(size);
   Corpus H   = CORPUS;
 #if BEND_CUDA
-  if (gpu) {
+  ft_gpu = ft;
+  if (map) {
     cuMemsetD8((CUdeviceptr)(uintptr_t)H, 0, STAK_OFF * 8);
     cuCtxSynchronize();
   }
@@ -6124,10 +7206,11 @@ int main(int argc, char** argv) {
     }
   }
   bool dev = gpu != 0 && BANGS != 0 && gpu_probe();
-  if (gpu == 1 && BANGS != 0 && !dev) {
+  bool ft  = gpu != 0 && FTOPS != 0 && (dev || gpu_probe());
+  if (gpu == 1 && (BANGS != 0 || FTOPS != 0) && !(dev || ft)) {
     cli_fail("--gpu on, but this binary found no GPU device", NULL);
   }
-  Corpus H  = corpus_setup(dev, thr > 0 ? thr : cpu_count(), mem);
+  Corpus H  = corpus_setup(dev, ft, thr > 0 ? thr : cpu_count(), mem);
   int code  = io_loop(H);
   io_sync();
   return code;
