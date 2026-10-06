@@ -4550,6 +4550,586 @@ static bool ft_fits(Term a, u64 rows, u64 cols, u64 o, u64 ld, u64 s,
 
 #endif
 
+// Cpu
+// ===
+
+// The bulk ops on the cores (no CUDA build, --gpu off, or a call the GPU
+// declines). ft_gemm_loop and ft_einsum_loop are the definitions in C; the
+// kernels here give every output the very same F32 steps in the same order
+// (a sum runs in order of its index from 0, fp contract is off, no FMA),
+// only many outputs at once: SIMD lanes and threads are distinct outputs.
+// They read raw pointers when no index wraps and no two outputs share a
+// cell; else the definitions run. BEND_FT=loop (or BEND_GEMM=loop) keeps
+// every call on the definitions (the oracle); BEND_FT=c skips the AVX2
+// kernels; BEND_FT_THREADS sets the kernels' threads (default --threads);
+// BEND_PROFILE=1 sums the calls at exit, 2 also prints each one.
+
+#if !DEVICE
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define FT_X86     1
+#define FT_AVX     __attribute__((target("avx2")))
+#define FT_RELAX() _mm_pause()
+#else
+#define FT_X86     0
+#define FT_RELAX() __asm__ __volatile__("" ::: "memory")
+#endif
+#define FT_FORCE static inline __attribute__((always_inline))
+#define FT_MAXT  256
+
+static long cpu_count(void);
+
+static double ft_secs(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+// BEND_FT: 1 loop (the definitions), 2 c (no AVX2), 0 neither
+static int ft_mode(void) {
+  static _Atomic int mode = -1;
+  int m = mode;
+  if (m < 0) {
+    const char* f = getenv("BEND_FT");
+    const char* g = getenv("BEND_GEMM");
+    m = (f != NULL && strcmp(f, "loop") == 0)
+      || (g != NULL && strcmp(g, "loop") == 0) ? 1
+      : f != NULL && strcmp(f, "c") == 0 ? 2 : 0;
+    mode = m;
+  }
+  return m;
+}
+
+#define ft_ref() (ft_mode() == 1)
+
+static bool ft_avx2(void) {
+#if FT_X86
+  static _Atomic int on = -1;
+  int v = on;
+  if (v < 0) {
+    __builtin_cpu_init();
+    v  = __builtin_cpu_supports("avx2") && ft_mode() != 2;
+    on = v;
+  }
+  return v > 0;
+#else
+  return false;
+#endif
+}
+
+// BEND_PROFILE on the cores (a CUDA build's GPU calls report as before)
+static struct {
+  pthread_mutex_t mu;
+  _Atomic int     on;
+  u64             calls, loops, ecalls, eloops;
+  double          ms, flop, ems;
+} FTS = { .mu = PTHREAD_MUTEX_INITIALIZER, .on = -1 };
+
+static void ft_cpu_report(void) {
+  fprintf(stderr, "bend profile: cpu gemm %llu calls (%llu as loops), %.3f"
+    " ms, %.3f GFLOP, %.1f GFLOP/s\n", (unsigned long long)FTS.calls,
+    (unsigned long long)FTS.loops, FTS.ms, FTS.flop / 1e9,
+    FTS.ms > 0 ? FTS.flop / FTS.ms / 1e6 : 0.0);
+  fprintf(stderr, "bend profile: cpu einsum %llu calls (%llu as loops),"
+    " %.3f ms\n", (unsigned long long)FTS.ecalls,
+    (unsigned long long)FTS.eloops, FTS.ems);
+}
+
+static int ft_cprof(void) {
+  int on = FTS.on;
+  if (on < 0) {
+    pthread_mutex_lock(&FTS.mu);
+    if (FTS.on < 0) {
+      const char* p = getenv("BEND_PROFILE");
+      FTS.on = p == NULL ? 0 : atoi(p) > 1 ? 2 : atoi(p) > 0 ? 1 : 0;
+      if (FTS.on > 0) {
+        atexit(ft_cpu_report);
+      }
+    }
+    on = FTS.on;
+    pthread_mutex_unlock(&FTS.mu);
+  }
+  return on;
+}
+
+// The kernels' threads: the caller and n - 1 workers, made at the first
+// parallel call. A job is total items in chunks; a thread claims the
+// next chunk by CAS on tick (job << 48 | chunks << 24 | next), and reads
+// the job only once it holds a chunk, so a late thread cannot run a stale
+// one. One job at a time (run, held by the caller for the whole op, also
+// guards the per-thread scratch). Idle workers spin briefly, then sleep.
+
+typedef void (*FtJob)(void* ctx, u64 lo, u64 hi, u32 tid);
+
+static struct {
+  pthread_mutex_t run;
+  pthread_mutex_t mu;
+  pthread_cond_t  cv;
+  u32             n, up, sleep;
+  _Atomic u32     gen;
+  _Atomic u64     tick;
+  _Atomic u64     done;
+  u64             job, total, chunk;
+  FtJob           fn;
+  void*           ctx;
+  void*           scr[FT_MAXT];
+  u64             scrn[FT_MAXT];
+} FTP = { .run = PTHREAD_MUTEX_INITIALIZER, .mu = PTHREAD_MUTEX_INITIALIZER,
+  .cv = PTHREAD_COND_INITIALIZER };
+
+// the threads a job may use (BEND_FT_THREADS, else --threads)
+static u32 ft_threads(void) {
+  if (FTP.n == 0) {
+    const char* v = getenv("BEND_FT_THREADS");
+    long        n = v != NULL ? atol(v) : 0;
+    if (n < 1) {
+      n = pool_size > 0 ? (long)pool_size : cpu_count();
+    }
+    FTP.n = n < 1 ? 1 : n > FT_MAXT ? FT_MAXT : (u32)n;
+  }
+  return FTP.n;
+}
+
+// a thread's scratch, 64-byte aligned (the caller holds FTP.run)
+static void* ft_scratch(u32 tid, u64 bytes) {
+  if (FTP.scrn[tid] < bytes) {
+    void* p = NULL;
+    free(FTP.scr[tid]);
+    if (posix_memalign(&p, 64, bytes < 64 ? 64 : bytes) != 0) {
+      err_fail("out of memory");
+    }
+    FTP.scr[tid]  = p;
+    FTP.scrn[tid] = bytes;
+  }
+  return FTP.scr[tid];
+}
+
+static void ft_chunks(u32 tid) {
+  for (;;) {
+    u64 t  = atomic_load_explicit(&FTP.tick, memory_order_acquire);
+    u64 nc = t >> 24 & 0xFFFFFF;
+    u64 c  = t & 0xFFFFFF;
+    if (c >= nc) {
+      return;
+    }
+    if (!atomic_compare_exchange_weak_explicit(&FTP.tick, &t, t + 1,
+        memory_order_acq_rel, memory_order_acquire)) {
+      continue;
+    }
+    u64 lo = c * FTP.chunk;
+    u64 hi = FTP.total - lo < FTP.chunk ? FTP.total : lo + FTP.chunk;
+    FTP.fn(FTP.ctx, lo, hi, tid);
+    atomic_fetch_add_explicit(&FTP.done, 1, memory_order_release);
+  }
+}
+
+static void* ft_worker(void* arg) {
+  u32 tid  = (u32)(uintptr_t)arg;
+  u32 seen = 0;
+  for (;;) {
+    u32    g  = atomic_load_explicit(&FTP.gen, memory_order_acquire);
+    double t0 = 0;
+    for (u32 s = 1; g == seen; s += 1) {
+      if ((s & 1023) == 0) {
+        double now = ft_secs();
+        t0 = t0 == 0 ? now : t0;
+        if (now - t0 > 2e-4) {
+          pthread_mutex_lock(&FTP.mu);
+          FTP.sleep += 1;
+          while ((g = atomic_load(&FTP.gen)) == seen) {
+            pthread_cond_wait(&FTP.cv, &FTP.mu);
+          }
+          FTP.sleep -= 1;
+          pthread_mutex_unlock(&FTP.mu);
+          break;
+        }
+      }
+      FT_RELAX();
+      g = atomic_load_explicit(&FTP.gen, memory_order_acquire);
+    }
+    seen = g;
+    ft_chunks(tid);
+  }
+  return NULL;
+}
+
+// runs fn over [0, total) in chunks, on every kernel thread; the caller
+// holds FTP.run
+static void ft_par(FtJob fn, void* ctx, u64 total, u64 chunk) {
+  chunk = chunk < 1 ? 1 : chunk;
+  if (total > chunk * 0xFFFFFF) {
+    chunk = (total + 0xFFFFFE) / 0xFFFFFF;
+  }
+  u64 nc = (total + chunk - 1) / chunk;
+  if (nc <= 1 || ft_threads() <= 1) {
+    if (total > 0) {
+      fn(ctx, 0, total, 0);
+    }
+    return;
+  }
+  if (!FTP.up) {
+    FTP.up = 1;
+    for (u32 w = 1; w < FTP.n; w += 1) {
+      pthread_t t;
+      if (pthread_create(&t, NULL, ft_worker, (void*)(uintptr_t)w) != 0) {
+        FTP.n = w;
+        break;
+      }
+      pthread_detach(t);
+    }
+  }
+  FTP.fn    = fn;
+  FTP.ctx   = ctx;
+  FTP.total = total;
+  FTP.chunk = chunk;
+  FTP.job   = (FTP.job + 1) & 0xFFFF;
+  atomic_store_explicit(&FTP.done, 0, memory_order_relaxed);
+  atomic_store_explicit(&FTP.tick, FTP.job << 48 | nc << 24,
+    memory_order_release);
+  pthread_mutex_lock(&FTP.mu);
+  atomic_fetch_add_explicit(&FTP.gen, 1, memory_order_release);
+  if (FTP.sleep > 0) {
+    pthread_cond_broadcast(&FTP.cv);
+  }
+  pthread_mutex_unlock(&FTP.mu);
+  ft_chunks(0);
+  for (u32 s = 1; atomic_load_explicit(&FTP.done, memory_order_acquire)
+      != nc; s += 1) {
+    if ((s & 4095) == 0) {
+      sched_yield();
+    } else {
+      FT_RELAX();
+    }
+  }
+}
+
+// Gemm on the cores: C's columns go in panels of nr (16, or 32 for one
+// row), each panel's op(B) packed as k rows of nr (zero past n; a
+// row-major op(B) under at most 8 rows of C is read in place instead,
+// each element being used about once), then blocks of up to 4 rows of C
+// against it, each entry summed over q from 0 in one accumulator (a
+// lane), α and β applied as the definition does. The units (batch,
+// panel, block of mb rows) split across the threads.
+
+typedef struct {
+  const u32a* A;      // op(A)(i, q) = A[bi·sa + i·ais + q·aqs]
+  const u32a* B;      // op(B)(q, j) = B[bi·sb + q·bqs + j·bjs]
+  u32a*       C;      // C(i, j) = C[bi·sc + i·ldc + j]
+  u64         ais, aqs, bqs, bjs, ldc, sa, sb, sc;
+  u32         m, n, k, nb, nr, mb, njp, nib;
+  f32         alpha, beta;
+  bool        avx, direct; // direct: op(B) row-major and few rows of C
+} FtG;
+
+// a view's top index, when every index it reaches lies in its array
+static bool ft_inside(Term a, u64 rows, u64 cols, u64 o, u64 ld, u64 s,
+  u64 nb, u64* top) {
+  u64 bs = (nb - 1) * s;
+  u64 rs = (rows - 1) * ld;
+  if (bs >= 1ull << 32 || rs >= 1ull << 32) {
+    return false;
+  }
+  *top = o + bs + rs + (cols - 1);
+  return *top < (1ull << blk_cls(a)) && *top < (1ull << 32);
+}
+
+// the panel of op(B) from column j0 (b points at its (0, j0))
+static void ft_gpack_c(const FtG* g, f32* P, const u32a* b, u32 cols) {
+  u32 nr = g->nr;
+  for (u32 q = 0; q < g->k; q += 1) {
+    const u32a* bq = b + q * g->bqs;
+    f32*        pq = P + (u64)q * nr;
+    for (u32 j = 0; j < nr; j += 1) {
+      pq[j] = j < cols ? f32_unbox(bq[j * g->bjs]) : 0.0f;
+    }
+  }
+}
+
+FT_FORCE void ft_gk_c(const u32 R, const u32 NR, const f32* P, u64 pst,
+  const u32a* a, u64 ais, u64 aqs, u32 k, f32* acc) {
+  f32 s[4][32];
+  for (u32 r = 0; r < R; r += 1) {
+    for (u32 j = 0; j < NR; j += 1) {
+      s[r][j] = 0.0f;
+    }
+  }
+  for (u32 q = 0; q < k; q += 1) {
+    const f32* pq = P + (u64)q * pst;
+    for (u32 r = 0; r < R; r += 1) {
+      f32 x = f32_unbox(a[r * ais + q * aqs]);
+      for (u32 j = 0; j < NR; j += 1) {
+        s[r][j] = s[r][j] + x * pq[j];
+      }
+    }
+  }
+  for (u32 r = 0; r < R; r += 1) {
+    for (u32 j = 0; j < NR; j += 1) {
+      acc[r * NR + j] = s[r][j];
+    }
+  }
+}
+
+static void ft_gkern_c(const FtG* g, const f32* P, u64 pst, const u32a* a, u32 R,
+  f32* acc) {
+  if (g->nr == 32) {
+    ft_gk_c(1, 32, P, pst, a, g->ais, g->aqs, g->k, acc);
+    return;
+  }
+  switch (R) {
+    case 1:  ft_gk_c(1, 16, P, pst, a, g->ais, g->aqs, g->k, acc); break;
+    case 2:  ft_gk_c(2, 16, P, pst, a, g->ais, g->aqs, g->k, acc); break;
+    case 3:  ft_gk_c(3, 16, P, pst, a, g->ais, g->aqs, g->k, acc); break;
+    default: ft_gk_c(4, 16, P, pst, a, g->ais, g->aqs, g->k, acc); break;
+  }
+}
+
+#if FT_X86
+
+// op(B) stored transposed (tb): 8×8 blocks transposed in registers
+FT_AVX static void ft_gpack_avx(const FtG* g, f32* P, const u32a* b,
+  u32 cols) {
+  u32 nr = g->nr, k = g->k;
+  if (g->bqs != 1 || cols != nr || k < 8) {
+    ft_gpack_c(g, P, b, cols);
+    return;
+  }
+  u64 ld = g->bjs;
+  u32 k8 = k & ~7u;
+  for (u32 j0 = 0; j0 < nr; j0 += 8) {
+    const float* r = (const float*)(b + (u64)j0 * ld);
+    for (u32 q = 0; q < k8; q += 8) {
+      __m256 x0 = _mm256_loadu_ps(r + 0 * ld + q);
+      __m256 x1 = _mm256_loadu_ps(r + 1 * ld + q);
+      __m256 x2 = _mm256_loadu_ps(r + 2 * ld + q);
+      __m256 x3 = _mm256_loadu_ps(r + 3 * ld + q);
+      __m256 x4 = _mm256_loadu_ps(r + 4 * ld + q);
+      __m256 x5 = _mm256_loadu_ps(r + 5 * ld + q);
+      __m256 x6 = _mm256_loadu_ps(r + 6 * ld + q);
+      __m256 x7 = _mm256_loadu_ps(r + 7 * ld + q);
+      __m256 t0 = _mm256_unpacklo_ps(x0, x1);
+      __m256 t1 = _mm256_unpackhi_ps(x0, x1);
+      __m256 t2 = _mm256_unpacklo_ps(x2, x3);
+      __m256 t3 = _mm256_unpackhi_ps(x2, x3);
+      __m256 t4 = _mm256_unpacklo_ps(x4, x5);
+      __m256 t5 = _mm256_unpackhi_ps(x4, x5);
+      __m256 t6 = _mm256_unpacklo_ps(x6, x7);
+      __m256 t7 = _mm256_unpackhi_ps(x6, x7);
+      __m256 u0 = _mm256_shuffle_ps(t0, t2, 0x44);
+      __m256 u1 = _mm256_shuffle_ps(t0, t2, 0xEE);
+      __m256 u2 = _mm256_shuffle_ps(t1, t3, 0x44);
+      __m256 u3 = _mm256_shuffle_ps(t1, t3, 0xEE);
+      __m256 u4 = _mm256_shuffle_ps(t4, t6, 0x44);
+      __m256 u5 = _mm256_shuffle_ps(t4, t6, 0xEE);
+      __m256 u6 = _mm256_shuffle_ps(t5, t7, 0x44);
+      __m256 u7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+      f32* p = P + (u64)q * nr + j0;
+      _mm256_store_ps(p + 0 * nr, _mm256_permute2f128_ps(u0, u4, 0x20));
+      _mm256_store_ps(p + 1 * nr, _mm256_permute2f128_ps(u1, u5, 0x20));
+      _mm256_store_ps(p + 2 * nr, _mm256_permute2f128_ps(u2, u6, 0x20));
+      _mm256_store_ps(p + 3 * nr, _mm256_permute2f128_ps(u3, u7, 0x20));
+      _mm256_store_ps(p + 4 * nr, _mm256_permute2f128_ps(u0, u4, 0x31));
+      _mm256_store_ps(p + 5 * nr, _mm256_permute2f128_ps(u1, u5, 0x31));
+      _mm256_store_ps(p + 6 * nr, _mm256_permute2f128_ps(u2, u6, 0x31));
+      _mm256_store_ps(p + 7 * nr, _mm256_permute2f128_ps(u3, u7, 0x31));
+    }
+  }
+  for (u32 q = k8; q < k; q += 1) {
+    for (u32 j = 0; j < nr; j += 1) {
+      P[(u64)q * nr + j] = f32_unbox(b[j * ld + q]);
+    }
+  }
+}
+
+// R rows by NV vectors of 8 columns: s = s + x·y per lane, q ascending
+FT_FORCE FT_AVX void ft_gk_avx(const u32 R, const u32 NV, const f32* P, u64 pst,
+  const u32a* a, u64 ais, u64 aqs, u32 k, f32* acc) {
+  __m256 s[4][4];
+  for (u32 r = 0; r < R; r += 1) {
+    for (u32 v = 0; v < NV; v += 1) {
+      s[r][v] = _mm256_setzero_ps();
+    }
+  }
+  for (u32 q = 0; q < k; q += 1) {
+    const f32* pq = P + (u64)q * pst;
+    __m256     y[4];
+    for (u32 v = 0; v < NV; v += 1) {
+      y[v] = _mm256_loadu_ps(pq + 8 * v);
+    }
+    for (u32 r = 0; r < R; r += 1) {
+      __m256 x = _mm256_set1_ps(f32_unbox(a[r * ais + q * aqs]));
+      for (u32 v = 0; v < NV; v += 1) {
+        s[r][v] = _mm256_add_ps(s[r][v], _mm256_mul_ps(x, y[v]));
+      }
+    }
+  }
+  for (u32 r = 0; r < R; r += 1) {
+    for (u32 v = 0; v < NV; v += 1) {
+      _mm256_storeu_ps(acc + r * 8 * NV + 8 * v, s[r][v]);
+    }
+  }
+}
+
+FT_AVX static void ft_gkern_avx(const FtG* g, const f32* P, u64 pst, const u32a* a,
+  u32 R, f32* acc) {
+  if (g->nr == 32) {
+    ft_gk_avx(1, 4, P, pst, a, g->ais, g->aqs, g->k, acc);
+    return;
+  }
+  switch (R) {
+    case 1:  ft_gk_avx(1, 2, P, pst, a, g->ais, g->aqs, g->k, acc); break;
+    case 2:  ft_gk_avx(2, 2, P, pst, a, g->ais, g->aqs, g->k, acc); break;
+    case 3:  ft_gk_avx(3, 2, P, pst, a, g->ais, g->aqs, g->k, acc); break;
+    default: ft_gk_avx(4, 2, P, pst, a, g->ais, g->aqs, g->k, acc); break;
+  }
+}
+
+#endif
+
+// C ← α·s (+ β·C unless β is 0) over R rows and the panel's cols
+static void ft_gput(const FtG* g, u32a* c, const f32* acc, u32 R,
+  u32 cols) {
+  for (u32 r = 0; r < R; r += 1) {
+    u32a*      cr = c + r * g->ldc;
+    const f32* ar = acc + r * g->nr;
+    for (u32 j = 0; j < cols; j += 1) {
+      f32 v = g->alpha * ar[j];
+      if (!(g->beta == 0.0f)) {
+        v = v + g->beta * f32_unbox(cr[j]);
+      }
+      cr[j] = (u32)f32_rewrap(v);
+    }
+  }
+}
+
+static void ft_gjob(void* ctx, u64 lo, u64 hi, u32 tid) {
+  const FtG* g   = (const FtG*)ctx;
+  u32        nr  = g->nr;
+  f32*       P   = (f32*)ft_scratch(tid, ((u64)g->k * nr + 4 * 32) * 4);
+  f32*       acc = P + (u64)g->k * nr;
+  u64        per = (u64)g->njp * g->nib;
+  u64        has = ~0ull;
+  for (u64 u = lo; u < hi; u += 1) {
+    u64 bi = u / per, w = u % per, jp = w / g->nib, ib = w % g->nib;
+    u32         j0   = (u32)jp * nr;
+    u32         cols = g->n - j0 < nr ? g->n - j0 : nr;
+    const u32a* b    = g->B + bi * g->sb + (u64)j0 * g->bjs;
+    const f32*  pan  = P;
+    u64         pst  = nr;
+    if (g->direct && cols == nr) {
+      // op(B)'s rows are the panel's (read where they lie, unaligned)
+      pan = (const f32*)b;
+      pst = g->bqs;
+    } else if (bi * g->njp + jp != has) {
+      has = bi * g->njp + jp;
+#if FT_X86
+      if (g->avx) {
+        ft_gpack_avx(g, P, b, cols);
+      } else
+#endif
+      ft_gpack_c(g, P, b, cols);
+    }
+    u32 i0 = (u32)ib * g->mb;
+    u32 i1 = g->m - i0 < g->mb ? g->m : i0 + g->mb;
+    for (u32 i = i0; i < i1; i += 4) {
+      u32         R = i1 - i < 4 ? i1 - i : 4;
+      const u32a* a = g->A + bi * g->sa + (u64)i * g->ais;
+#if FT_X86
+      if (g->avx) {
+        ft_gkern_avx(g, pan, pst, a, R, acc);
+      } else
+#endif
+      ft_gkern_c(g, pan, pst, a, R, acc);
+      ft_gput(g, g->C + bi * g->sc + (u64)i * g->ldc + j0, acc, R, cols);
+    }
+  }
+}
+
+// false when a view wraps or C's entries could share a cell (or overlap
+// what A or B read): the definition runs instead
+FAR bool ft_gemm_fast(Env e, u32 ta, u32 tb, u32 m, u32 n, u32 k, u32 nb,
+  f32 al, Term a, u32 ao, u32 lda, u32 sa, Term b, u32 bo, u32 ldb, u32 sb,
+  f32 be, Term c, u32 co, u32 ldc, u32 sc) {
+  if (m == 0 || n == 0 || nb == 0) {
+    return true;
+  }
+  u64 at = 0, bt = 0, ct = 0;
+  if (!ft_inside(c, m, n, co, ldc, sc, nb, &ct)
+    || (m > 1 && ldc < n)
+    || (nb > 1 && (u64)sc < ((u64)m - 1) * ldc + n)) {
+    return false;
+  }
+  if (k > 0 && (!ft_inside(a, ta ? k : m, ta ? m : k, ao, lda, sa, nb, &at)
+    || !ft_inside(b, tb ? n : k, tb ? k : n, bo, ldb, sb, nb, &bt)
+    || (term_loc(a) == term_loc(c) && ao <= ct && co <= at)
+    || (term_loc(b) == term_loc(c) && bo <= ct && co <= bt))) {
+    return false;
+  }
+  DEV u64* H = e.mem;
+  FtG g;
+  g.A     = ft_cell(H, a, ao);
+  g.B     = ft_cell(H, b, bo);
+  g.C     = ft_cell(H, c, co);
+  g.ais   = ta ? 1 : lda;
+  g.aqs   = ta ? lda : 1;
+  g.bqs   = tb ? 1 : ldb;
+  g.bjs   = tb ? ldb : 1;
+  g.ldc   = ldc;
+  g.sa    = sa;
+  g.sb    = sb;
+  g.sc    = sc;
+  g.m     = m;
+  g.n     = n;
+  g.k     = k;
+  g.nb    = nb;
+  g.nr    = m == 1 ? 32 : 16;
+  g.mb    = m < 64 ? m : 64;
+  g.njp   = (n + g.nr - 1) / g.nr;
+  g.nib   = (m + g.mb - 1) / g.mb;
+  g.alpha = al;
+  g.beta  = be;
+  g.avx    = ft_avx2();
+  g.direct = !tb && m <= 8;
+  u64 units = (u64)nb * g.njp * g.nib;
+  double work = (double)m * n * (k > 0 ? k : 1) * nb;
+  pthread_mutex_lock(&FTP.run);
+  u64 nt    = work < 65536.0 ? 1 : ft_threads();
+  u64 chunk = nt <= 1 ? units : units / (nt * 4);
+  ft_par(ft_gjob, &g, units, chunk);
+  pthread_mutex_unlock(&FTP.run);
+  return true;
+}
+
+static void ft_gemm_cpu(Env e, u32 ta, u32 tb, u32 m, u32 n, u32 k, u32 nb,
+  f32 al, Term a, u32 ao, u32 lda, u32 sa, Term b, u32 bo, u32 ldb, u32 sb,
+  f32 be, Term c, u32 co, u32 ldc, u32 sc) {
+  int    prof = ft_gpu ? 0 : ft_cprof();
+  double t0   = prof ? ft_secs() : 0;
+  bool   fast = !ft_ref() && ft_gemm_fast(e, ta != 0, tb != 0, m, n, k, nb,
+    al, a, ao, lda, sa, b, bo, ldb, sb, be, c, co, ldc, sc);
+  if (!fast) {
+    ft_gemm_loop(e, ta, tb, m, n, k, nb, al, a, ao, lda, sa, b, bo, ldb, sb,
+      be, c, co, ldc, sc);
+  }
+  if (prof) {
+    double ms   = (ft_secs() - t0) * 1e3;
+    double flop = 2.0 * m * n * k * nb;
+    pthread_mutex_lock(&FTS.mu);
+    FTS.calls += 1;
+    FTS.loops += !fast;
+    FTS.ms    += ms;
+    FTS.flop  += flop;
+    pthread_mutex_unlock(&FTS.mu);
+    if (prof > 1) {
+      fprintf(stderr, "bend profile: cpu gemm %s %ux%ux%u x%u t%u%u %.3f ms"
+        " %.1f GFLOP/s\n", fast ? "fast" : "loop", m, n, k, nb, ta != 0,
+        tb != 0, ms, ms > 0 ? flop / ms / 1e6 : 0.0);
+    }
+  }
+}
+
+#endif
+
 OUTLINE Term ft_gemm(Env e, u64 ta, u64 tb, u64 m, u64 n, u64 k, u64 nb,
   u64 alpha, Term a, u64 ao, u64 lda, u64 sa, Term b, u64 bo, u64 ldb,
   u64 sb, u64 beta, Term c, u64 co, u64 ldc, u64 sc) {
@@ -4590,9 +5170,15 @@ OUTLINE Term ft_gemm(Env e, u64 ta, u64 tb, u64 m, u64 n, u64 k, u64 nb,
     FT.loops += 1;
     FT_WAIT();
 #endif
+#if DEVICE
     ft_gemm_loop(e, (u32)ta, (u32)tb, m_, n_, k_, nb_, al, a, (u32)ao,
       (u32)lda, (u32)sa, b, (u32)bo, (u32)ldb, (u32)sb, be, c, (u32)co,
       (u32)ldc, (u32)sc);
+#else
+    ft_gemm_cpu(e, (u32)ta, (u32)tb, m_, n_, k_, nb_, al, a, (u32)ao,
+      (u32)lda, (u32)sa, b, (u32)bo, (u32)ldb, (u32)sb, be, c, (u32)co,
+      (u32)ldc, (u32)sc);
+#endif
 #if !DEVICE && BEND_CUDA
   }
   if (ft_gpu && FT.prof > 0) {
@@ -4637,12 +5223,13 @@ typedef struct {
   int a, b, s;
 } FtNode;
 
+// ex last: a cached spec (ft_spec_get) keeps only its nex nodes
 typedef struct {
   u32    n[6], red, op, acc, nin;
   FtView out, in[FT_MAXIN];
-  FtNode ex[FT_MAXEX];
   u32    nex;
   const char* extext;
+  FtNode ex[FT_MAXEX];
 } FtSpec;
 
 #if !DEVICE
@@ -5309,20 +5896,684 @@ static void ft_einsum_gpu(Env e, const FtSpec* s, Term x) {
 
 #endif
 
+#if !DEVICE
+
+// Einsum on the cores. Each distinct spec string is parsed and checked
+// once (a table of FT_NCACHE entries by hash), and its expression compiled
+// to steps over slots, each slot one F32 per element of a tile (P points
+// by Q reduced points): a step is one op over the whole tile, so every
+// element gets ft_eval's ops in ft_eval's order (a select computes both
+// sides and keeps one; nothing has effects). Each point then reduces its Q
+// values in order, as the loop does. Points run on many threads only when
+// none can see another's write: a direct output reaching each cell once,
+// every view inside the array (so ft_check's spans are exact), and each
+// gather's targets (scanned first) off the output. Else one point at a
+// time, in the loop's order.
+
+typedef struct {
+  u8  k, op; // k: 0 unary, 1 binary, 2 select
+  uint16_t d, a, b, c;
+} FtIns;
+
+typedef struct {
+  u64     h, len;
+  char*   text;
+  FtSpec* s;
+  FtIns*  ins;
+  f32*    cst;
+  u32     nins, ncst, nslot, res, idx, refs, cost;
+  bool    dead;
+} FtEnt;
+
+#define FT_NCACHE 4096
+#define FT_TILE   256
+
+static struct {
+  pthread_mutex_t mu;
+  FtEnt*          e[FT_NCACHE];
+} FTC = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+static u64 ft_hash(const char* p, u64 n) {
+  u64 h = 14695981039346656037ull;
+  for (u64 i = 0; i < n; i += 1) {
+    h = (h ^ (u8)p[i]) * 1099511628211ull;
+  }
+  return h;
+}
+
+// operands while compiling: kind << 14 | number, the kind 0 an input, 1
+// an index, 2 a constant, 3 a step's result
+static uint16_t ft_kcst(FtEnt* en, f32 c) {
+  u32 cb = (u32)f32_rewrap(c);
+  for (u32 i = 0; i < en->ncst; i += 1) {
+    if ((u32)f32_rewrap(en->cst[i]) == cb) {
+      return (uint16_t)(2 << 14 | i);
+    }
+  }
+  en->cst[en->ncst] = c;
+  return (uint16_t)(2 << 14 | en->ncst++);
+}
+
+static uint16_t ft_comp(FtEnt* en, const FtSpec* s, int at) {
+  const FtNode* nd = &s->ex[at];
+  uint16_t a = 0, b = 0, c = 0;
+  switch (nd->k) {
+    case 0:
+      return nd->op < s->nin ? (uint16_t)nd->op : ft_kcst(en, 0.0f);
+    case 1:
+      if (nd->op < 6) {
+        en->idx |= 1u << nd->op;
+        return (uint16_t)(1 << 14 | nd->op);
+      }
+      return ft_kcst(en, 0.0f);
+    case 2:
+      return ft_kcst(en, nd->c);
+    case 3:
+      a = ft_comp(en, s, nd->a);
+      break;
+    case 4:
+      a = ft_comp(en, s, nd->a);
+      b = ft_comp(en, s, nd->b);
+      break;
+    default:
+      c = ft_comp(en, s, nd->s);
+      a = ft_comp(en, s, nd->a);
+      b = ft_comp(en, s, nd->b);
+      break;
+  }
+  FtIns* in = &en->ins[en->nins];
+  in->k  = nd->k == 3 ? 0 : nd->k == 4 ? 1 : 2;
+  in->op = (u8)(nd->k == 3 ? (nd->op < 4 ? nd->op : 4)
+    : nd->k == 4 ? (nd->op < 7 ? nd->op : 7) : 0);
+  in->a  = a;
+  in->b  = b;
+  in->c  = c;
+  in->d  = (uint16_t)(3 << 14 | en->nins);
+  en->nins += 1;
+  return in->d;
+}
+
+// slots: the inputs, the six indices, the constants, the steps
+static uint16_t ft_slot(const FtEnt* en, uint16_t o) {
+  u32 n = en->s->nin;
+  switch (o >> 14) {
+    case 0:  return o;
+    case 1:  return (uint16_t)(n + (o & 0x3FFF));
+    case 2:  return (uint16_t)(n + 6 + (o & 0x3FFF));
+    default: return (uint16_t)(n + 6 + en->ncst + (o & 0x3FFF));
+  }
+}
+
+static void* ft_alloc(u64 n) {
+  void* p = malloc(n < 1 ? 1 : n);
+  if (p == NULL) {
+    err_fail("out of memory");
+  }
+  return p;
+}
+
+static FtEnt* ft_ent_new(const char* t, u64 len, u64 h) {
+  FtSpec* full = ft_alloc(sizeof(FtSpec));
+  ft_parse(t, full);
+  ft_check(full);
+  u64    sz = __builtin_offsetof(FtSpec, ex) + (u64)full->nex * sizeof(FtNode);
+  FtEnt* en = ft_alloc(sizeof(FtEnt));
+  memset(en, 0, sizeof *en);
+  en->h    = h;
+  en->len  = len;
+  en->text = ft_alloc(len + 1);
+  memcpy(en->text, t, len + 1);
+  en->s    = ft_alloc(sz);
+  memcpy(en->s, full, sz);
+  en->s->extext = en->text + (full->extext - t);
+  en->ins  = ft_alloc((u64)full->nex * sizeof(FtIns));
+  en->cst  = ft_alloc((u64)full->nex * sizeof(f32));
+  free(full);
+  uint16_t r = ft_comp(en, en->s, 0);
+  for (u32 i = 0; i < en->nins; i += 1) {
+    FtIns* in = &en->ins[i];
+    in->d = ft_slot(en, in->d);
+    in->a = ft_slot(en, in->a);
+    in->b = ft_slot(en, in->b);
+    in->c = ft_slot(en, in->c);
+  }
+  en->res   = ft_slot(en, r);
+  en->nslot = en->s->nin + 6 + en->ncst + en->nins;
+  // rough ns per element, for when threads pay
+  en->cost  = 2;
+  for (u32 i = 0; i < en->s->nin; i += 1) {
+    en->cost += en->s->in[i].ix ? 3 : 1;
+  }
+  for (u32 i = 0; i < en->nins; i += 1) {
+    const FtIns* in = &en->ins[i];
+    en->cost += in->k == 0 && (in->op == 1 || in->op == 2) ? 40
+      : (in->k == 0 && in->op == 3) || (in->k == 1 && in->op == 3) ? 4 : 1;
+  }
+  return en;
+}
+
+static void ft_ent_free(FtEnt* en) {
+  free(en->text);
+  free(en->s);
+  free(en->ins);
+  free(en->cst);
+  free(en);
+}
+
+// the spec's entry, held until ft_spec_put
+static FtEnt* ft_spec_get(const char* t, u64 len) {
+  u64     h  = ft_hash(t, len);
+  FtEnt** at = &FTC.e[h & (FT_NCACHE - 1)];
+  pthread_mutex_lock(&FTC.mu);
+  FtEnt* en = *at;
+  if (en != NULL && en->h == h && en->len == len
+    && memcmp(en->text, t, len) == 0) {
+    en->refs += 1;
+    pthread_mutex_unlock(&FTC.mu);
+    return en;
+  }
+  pthread_mutex_unlock(&FTC.mu);
+  FtEnt* nw = ft_ent_new(t, len, h);
+  nw->refs = 1;
+  pthread_mutex_lock(&FTC.mu);
+  FtEnt* old = *at;
+  if (old != NULL && old->refs == 0) {
+    ft_ent_free(old);
+  } else if (old != NULL) {
+    old->dead = true;
+  }
+  *at = nw;
+  pthread_mutex_unlock(&FTC.mu);
+  return nw;
+}
+
+static void ft_spec_put(FtEnt* en) {
+  pthread_mutex_lock(&FTC.mu);
+  en->refs -= 1;
+  bool gone = en->dead && en->refs == 0;
+  pthread_mutex_unlock(&FTC.mu);
+  if (gone) {
+    ft_ent_free(en);
+  }
+}
+
+typedef struct {
+  const FtSpec* s;
+  const FtEnt*  en;
+  u32a*         X;
+  u32           mask, P, Q, pdim, rdim, gat;
+  int           kp, kr; // the innermost unreduced and reduced index (or -1)
+  u64           nred, olo, ohi;
+  bool          scan;
+  _Atomic u32   clash;
+} FtE;
+
+// a direct view's top index over the indices of sel (2^40 when past it)
+static u64 ft_top(u32 off, const u32* st, const u32* n, u32 sel) {
+  u64 hi = off;
+  for (u32 k = 0; k < 6; k += 1) {
+    if (sel >> k & 1 && n[k] > 0) {
+      u64 t = (u64)st[k] * (n[k] - 1);
+      if (t >= 1ull << 40) {
+        return 1ull << 40;
+      }
+      hi += t;
+    }
+  }
+  return hi < 1ull << 40 ? hi : 1ull << 40;
+}
+
+// may the points run in any order (a gather's targets still to scan)?
+static bool ft_epar(FtE* E) {
+  const FtSpec* s   = E->s;
+  u64           N   = (u64)E->mask + 1;
+  u32           unr = 63 & ~s->red;
+  if (s->out.ix) {
+    return false;
+  }
+  u64 ohi = ft_top(s->out.off, s->out.st, s->n, unr);
+  if (ohi >= N) {
+    return false;
+  }
+  // each output cell once: the strides, sorted, each past what the
+  // smaller ones reach
+  u64 st[6], cnt[6];
+  u32 nd = 0;
+  for (u32 k = 0; k < 6; k += 1) {
+    if (unr >> k & 1 && s->n[k] > 1) {
+      if (s->out.st[k] == 0) {
+        return false;
+      }
+      u32 j = nd++;
+      while (j > 0 && st[j - 1] > s->out.st[k]) {
+        st[j]  = st[j - 1];
+        cnt[j] = cnt[j - 1];
+        j     -= 1;
+      }
+      st[j]  = s->out.st[k];
+      cnt[j] = s->n[k];
+    }
+  }
+  u64 reach = 0;
+  for (u32 j = 0; j < nd; j += 1) {
+    if (st[j] <= reach) {
+      return false;
+    }
+    reach += st[j] * (cnt[j] - 1);
+  }
+  E->gat = 0;
+  for (u32 i = 0; i < s->nin; i += 1) {
+    const FtView* v = &s->in[i];
+    if (!v->ix && ft_top(v->off, v->st, s->n, 63) >= N) {
+      return false;
+    }
+    if (v->ix) {
+      if (ft_top(v->ioff, v->ist, s->n, 63) >= N) {
+        return false;
+      }
+      E->gat |= 1u << i;
+    }
+  }
+  E->olo = s->out.off;
+  E->ohi = ohi;
+  return true;
+}
+
+// one step over the tile's ne elements (d is its own slot)
+FT_FORCE void ft_estep(const FtIns* in, f32* sl, u32 T, u32 ne) {
+  f32* restrict d = sl + (u64)in->d * T;
+  const f32*    a = sl + (u64)in->a * T;
+  const f32*    b = sl + (u64)in->b * T;
+  const f32*    c = sl + (u64)in->c * T;
+  if (in->k == 0) {
+    switch (in->op) {
+      case 0:
+        for (u32 e = 0; e < ne; e += 1) d[e] = -a[e];
+        break;
+      case 1:
+        for (u32 e = 0; e < ne; e += 1) d[e] = (f32)exp((double)a[e]);
+        break;
+      case 2:
+        for (u32 e = 0; e < ne; e += 1) d[e] = (f32)log((double)a[e]);
+        break;
+      case 3:
+        for (u32 e = 0; e < ne; e += 1) d[e] = (f32)sqrt((double)a[e]);
+        break;
+      default:
+        for (u32 e = 0; e < ne; e += 1) d[e] = (f32)fabs((double)a[e]);
+        break;
+    }
+  } else if (in->k == 1) {
+    switch (in->op) {
+      case 0:
+        for (u32 e = 0; e < ne; e += 1) d[e] = a[e] + b[e];
+        break;
+      case 1:
+        for (u32 e = 0; e < ne; e += 1) d[e] = a[e] - b[e];
+        break;
+      case 2:
+        for (u32 e = 0; e < ne; e += 1) d[e] = a[e] * b[e];
+        break;
+      case 3:
+        for (u32 e = 0; e < ne; e += 1) d[e] = a[e] / b[e];
+        break;
+      case 4:
+        for (u32 e = 0; e < ne; e += 1) d[e] = a[e] > b[e] ? a[e] : b[e];
+        break;
+      case 5:
+        for (u32 e = 0; e < ne; e += 1) d[e] = a[e] < b[e] ? a[e] : b[e];
+        break;
+      case 6:
+        for (u32 e = 0; e < ne; e += 1) d[e] = a[e] < b[e] ? 1.0f : 0.0f;
+        break;
+      default:
+        for (u32 e = 0; e < ne; e += 1) d[e] = a[e] <= b[e] ? 1.0f : 0.0f;
+        break;
+    }
+  } else {
+    for (u32 e = 0; e < ne; e += 1) d[e] = c[e] != 0.0f ? a[e] : b[e];
+  }
+}
+
+// the points [lo, hi) in tiles of up to P points along the innermost
+// unreduced index (kp) by up to Q reduced points along the innermost
+// reduced one (kr), so each index in a tile is affine, base + pp·ps +
+// qq·qs (u32, the sums ft_vat makes), and is masked unless the run cannot
+// pass the array's end. Counters over the other indices carry between
+// tiles: no division per point.
+FT_FORCE void ft_ebody(void* ctx, u64 lo, u64 hi, u32 tid) {
+  FtE*          E    = (FtE*)ctx;
+  const FtSpec* s    = E->s;
+  const FtEnt*  en   = E->en;
+  u32a*         X    = E->X;
+  u32           mask = E->mask, nin = s->nin, P = E->P, Q = E->Q;
+  u32           T    = P * Q, ns = 2 * nin + 2, unr = 63 & ~s->red;
+  int           kp   = E->kp, kr = E->kr;
+  f32*          sl   = (f32*)ft_scratch(tid, ((u64)en->nslot * T + P) * 4);
+  f32*          r    = sl + (u64)en->nslot * T;
+  for (u32 c = 0; c < en->ncst; c += 1) {
+    f32* d = sl + (u64)(nin + 6 + c) * T;
+    for (u32 e = 0; e < T; e += 1) {
+      d[e] = en->cst[c];
+    }
+  }
+  u32 dst[6][2 * FT_MAXIN + 2], sum[2 * FT_MAXIN + 2];
+  u32 ps[2 * FT_MAXIN + 2], qs[2 * FT_MAXIN + 2];
+  u32 p[6] = { 0, 0, 0, 0, 0, 0 };
+  ft_unflat(lo, s->n, unr, p);
+  for (u32 j = 0; j < ns; j += 1) {
+    const FtView* v  = j < 2 * nin ? &s->in[j / 2] : &s->out;
+    bool          ix = j & 1;
+    sum[j] = ix ? v->ioff : v->off;
+    for (u32 k = 0; k < 6; k += 1) {
+      dst[k][j] = ix ? v->ist[k] : v->st[k];
+      sum[j]   += dst[k][j] * p[k];
+    }
+    ps[j] = kp >= 0 ? dst[kp][j] : 0;
+    qs[j] = kr >= 0 ? dst[kr][j] : 0;
+  }
+  u32 prow = kp >= 0 ? s->n[kp] : 1;
+  u32 qrow = kr >= 0 ? s->n[kr] : 1;
+  f32 init = s->op == 0 ? 0.0f : -INFINITY;
+  for (u64 o = lo; o < hi;) {
+    u32 pin = kp >= 0 ? p[kp] : 0;
+    u32 np  = hi - o < P ? (u32)(hi - o) : P;
+    np      = prow - pin < np ? prow - pin : np;
+    for (u32 pp = 0; pp < np; pp += 1) {
+      r[pp] = init;
+    }
+    u32 qp[6] = { 0, 0, 0, 0, 0, 0 };
+    u32 rs[2 * FT_MAXIN];
+    for (u32 j = 0; j < 2 * nin; j += 1) {
+      rs[j] = 0;
+    }
+    for (u64 q0 = 0; q0 < E->nred;) {
+      u32 qin = kr >= 0 ? qp[kr] : 0;
+      u32 nq  = E->nred - q0 < Q ? (u32)(E->nred - q0) : Q;
+      nq      = qrow - qin < nq ? qrow - qin : nq;
+      // each input at element pp·nq + qq: X at its index, masked as ft_vat
+      // and ft_get mask it (an index that cannot wrap reads directly)
+      for (u32 i = 0; i < nin; i += 1) {
+        const FtView* v  = &s->in[i];
+        f32*          d  = sl + (u64)i * T;
+        u32           b  = sum[2 * i] + rs[2 * i];
+        u32           bp = ps[2 * i], bq = qs[2 * i];
+        if (!v->ix) {
+          u64 top = (u64)b + (u64)(np - 1) * bp + (u64)(nq - 1) * bq;
+          if (E->scan) {
+            continue;
+          } else if (top <= mask && nq == 1) {
+            const u32a* xb = X + b;
+            if (bp == 1) {
+              for (u32 pp = 0; pp < np; pp += 1) {
+                d[pp] = f32_unbox(xb[pp]);
+              }
+            } else {
+              for (u32 pp = 0; pp < np; pp += 1) {
+                d[pp] = f32_unbox(xb[(u64)pp * bp]);
+              }
+            }
+          } else if (top <= mask) {
+            for (u32 pp = 0; pp < np; pp += 1) {
+              const u32a* xr = X + b + (u64)pp * bp;
+              f32*        dd = d + pp * nq;
+              if (bq == 1) {
+                for (u32 qq = 0; qq < nq; qq += 1) {
+                  dd[qq] = f32_unbox(xr[qq]);
+                }
+              } else {
+                for (u32 qq = 0; qq < nq; qq += 1) {
+                  dd[qq] = f32_unbox(xr[(u64)qq * bq]);
+                }
+              }
+            }
+          } else {
+            for (u32 pp = 0; pp < np; pp += 1) {
+              for (u32 qq = 0; qq < nq; qq += 1) {
+                d[pp * nq + qq] = f32_unbox(X[(b + pp * bp + qq * bq) & mask]);
+              }
+            }
+          }
+          continue;
+        }
+        u32 c  = sum[2 * i + 1] + rs[2 * i + 1];
+        u32 cp = ps[2 * i + 1], cq = qs[2 * i + 1], mul = v->imul;
+        for (u32 pp = 0; pp < np; pp += 1) {
+          for (u32 qq = 0; qq < nq; qq += 1) {
+            u32 ix = (c + pp * cp + qq * cq) & mask;
+            u32 at = (b + pp * bp + qq * bq
+              + mul * (u32)f32_to_u32(X[ix])) & mask;
+            if (!E->scan) {
+              d[pp * nq + qq] = f32_unbox(X[at]);
+            } else if (at >= E->olo && at <= E->ohi) {
+              atomic_store_explicit(&E->clash, 1, memory_order_relaxed);
+            }
+          }
+        }
+      }
+      if (!E->scan) {
+        for (u32 k = 0; k < 6; k += 1) {
+          if (!(en->idx >> k & 1)) {
+            continue;
+          }
+          f32* d   = sl + (u64)(nin + k) * T;
+          bool red = s->red >> k & 1;
+          for (u32 pp = 0; pp < np; pp += 1) {
+            for (u32 qq = 0; qq < nq; qq += 1) {
+              d[pp * nq + qq] = (f32)(red ? ((int)k == kr ? qin + qq : qp[k])
+                : (int)k == kp ? pin + pp : p[k]);
+            }
+          }
+        }
+        u32 ne = np * nq;
+        for (u32 t = 0; t < en->nins; t += 1) {
+          ft_estep(&en->ins[t], sl, T, ne);
+        }
+        const f32* tv = sl + (u64)en->res * T;
+        if (nq == 1 && s->op == 0) {
+          for (u32 pp = 0; pp < np; pp += 1) {
+            r[pp] = r[pp] + tv[pp];
+          }
+        } else if (nq == 1) {
+          for (u32 pp = 0; pp < np; pp += 1) {
+            r[pp] = tv[pp] > r[pp] ? tv[pp] : r[pp];
+          }
+        } else {
+          for (u32 pp = 0; pp < np; pp += 1) {
+            const f32* tt = tv + pp * nq;
+            f32        rr = r[pp];
+            if (s->op == 0) {
+              for (u32 qq = 0; qq < nq; qq += 1) {
+                rr = rr + tt[qq];
+              }
+            } else {
+              for (u32 qq = 0; qq < nq; qq += 1) {
+                rr = tt[qq] > rr ? tt[qq] : rr;
+              }
+            }
+            r[pp] = rr;
+          }
+        }
+      }
+      // the next reduced points
+      q0 += nq;
+      if (kr >= 0) {
+        qp[kr] += nq;
+        for (u32 j = 0; j < 2 * nin; j += 1) {
+          rs[j] += nq * qs[j];
+        }
+        if (qp[kr] == qrow) {
+          qp[kr] = 0;
+          for (u32 j = 0; j < 2 * nin; j += 1) {
+            rs[j] -= qrow * qs[j];
+          }
+          for (int k = kr - 1; k >= 0; k -= 1) {
+            if (!(E->rdim >> k & 1)) {
+              continue;
+            }
+            qp[k] += 1;
+            for (u32 j = 0; j < 2 * nin; j += 1) {
+              rs[j] += dst[k][j];
+            }
+            if (qp[k] < s->n[k]) {
+              break;
+            }
+            qp[k] = 0;
+            for (u32 j = 0; j < 2 * nin; j += 1) {
+              rs[j] -= dst[k][j] * s->n[k];
+            }
+          }
+        }
+      }
+    }
+    if (!E->scan) {
+      u32 ob = sum[2 * nin], obp = ps[2 * nin];
+      if (!s->out.ix && obp == 1 && (u64)ob + np - 1 <= mask) {
+        u32a* c = X + ob;
+        if (s->acc) {
+          for (u32 pp = 0; pp < np; pp += 1) {
+            c[pp] = (u32)f32_rewrap(f32_unbox(c[pp]) + r[pp]);
+          }
+        } else {
+          for (u32 pp = 0; pp < np; pp += 1) {
+            c[pp] = (u32)f32_rewrap(r[pp]);
+          }
+        }
+      } else {
+        u32 oc = sum[2 * nin + 1], ocp = ps[2 * nin + 1];
+        for (u32 pp = 0; pp < np; pp += 1) {
+          u32 at = ob + pp * obp;
+          if (s->out.ix) {
+            at += s->out.imul * (u32)f32_to_u32(X[(oc + pp * ocp) & mask]);
+          }
+          u32a* c = X + (at & mask);
+          f32   w = s->acc ? f32_unbox(*c) + r[pp] : r[pp];
+          *c = (u32)f32_rewrap(w);
+        }
+      }
+    }
+    // the next points
+    o += np;
+    if (kp >= 0) {
+      p[kp] += np;
+      for (u32 j = 0; j < ns; j += 1) {
+        sum[j] += np * ps[j];
+      }
+      if (p[kp] == prow) {
+        p[kp] = 0;
+        for (u32 j = 0; j < ns; j += 1) {
+          sum[j] -= prow * ps[j];
+        }
+        for (int k = kp - 1; k >= 0; k -= 1) {
+          if (!(E->pdim >> k & 1)) {
+            continue;
+          }
+          p[k] += 1;
+          for (u32 j = 0; j < ns; j += 1) {
+            sum[j] += dst[k][j];
+          }
+          if (p[k] < s->n[k]) {
+            break;
+          }
+          p[k] = 0;
+          for (u32 j = 0; j < ns; j += 1) {
+            sum[j] -= dst[k][j] * s->n[k];
+          }
+        }
+      }
+    }
+  }
+}
+
+static void ft_ejob_c(void* ctx, u64 lo, u64 hi, u32 tid) {
+  ft_ebody(ctx, lo, hi, tid);
+}
+
+#if FT_X86
+FT_AVX static void ft_ejob_avx(void* ctx, u64 lo, u64 hi, u32 tid) {
+  ft_ebody(ctx, lo, hi, tid);
+}
+#endif
+
+FAR void ft_einsum_cpu(Env e, FtEnt* en, Term x) {
+  const FtSpec* s    = en->s;
+  int           prof = ft_gpu ? 0 : ft_cprof();
+  double        t0   = prof ? ft_secs() : 0;
+  u32           unr  = 63 & ~s->red;
+  u64           nout = ft_count(s->n, unr);
+  u64           nred = ft_count(s->n, s->red);
+  int           how  = 0;
+  if (ft_ref()) {
+    ft_einsum_loop(e, s, x);
+  } else if (nout > 0) {
+    FtE E  = { .s = s, .en = en, .nred = nred, .kp = -1, .kr = -1 };
+    E.X    = ft_cell(e.mem, x, 0);
+    E.mask = (u32)((1ull << blk_cls(x)) - 1);
+    for (u32 k = 0; k < 6; k += 1) {
+      if (s->n[k] > 1 && s->red >> k & 1) {
+        E.rdim |= 1u << k;
+        E.kr    = (int)k;
+      } else if (s->n[k] > 1) {
+        E.pdim |= 1u << k;
+        E.kp    = (int)k;
+      }
+    }
+    FtJob job = ft_ejob_c;
+#if FT_X86
+    job = ft_avx2() ? ft_ejob_avx : ft_ejob_c;
+#endif
+    u32  qrow = E.kr >= 0 ? s->n[E.kr] : 1;
+    bool par  = ft_epar(&E);
+    // threads only past about 30 µs of work (en->cost per element)
+    double work = (double)nout * (double)(nred == 0 ? 1 : nred) * en->cost;
+    pthread_mutex_lock(&FTP.run);
+    u64 nt = work < 32768.0 ? 1 : ft_threads();
+    E.Q    = qrow < FT_TILE ? qrow : FT_TILE;
+    E.P    = FT_TILE / E.Q;
+    u64 ch = nout / (nt * 8) > E.P ? nout / (nt * 8) : E.P;
+    ch     = nt <= 1 ? nout : (ch + E.P - 1) / E.P * E.P;
+    if (par && E.gat != 0) {
+      E.scan = true;
+      ft_par(job, &E, nout, ch);
+      E.scan = false;
+      par    = atomic_load(&E.clash) == 0;
+    }
+    if (!par) {
+      E.P = 1;
+      ch  = nout;
+    }
+    ft_par(job, &E, nout, ch);
+    pthread_mutex_unlock(&FTP.run);
+    how = par ? 2 : 1;
+  }
+  if (prof) {
+    double ms = (ft_secs() - t0) * 1e3;
+    pthread_mutex_lock(&FTS.mu);
+    FTS.ecalls += 1;
+    FTS.eloops += how == 0;
+    FTS.ems    += ms;
+    pthread_mutex_unlock(&FTS.mu);
+    if (prof > 1) {
+      fprintf(stderr, "bend profile: cpu einsum %s %llux%llu %.3f ms %.60s\n",
+        how == 2 ? "par" : how == 1 ? "serial" : "loop",
+        (unsigned long long)nout, (unsigned long long)nred, ms, s->extext);
+    }
+  }
+}
+
+#endif
+
 OUTLINE Term ft_einsum(Env e, Term spec, Term x) {
 #if DEVICE
   term_sink(e, spec);
   err_post(e.mem, ERR_TAGS);
   return x;
 #else
-  u64    n = 0;
-  char*  t = io_cbuf(e, spec, &n, CID(SCon));
-  FtSpec* s = malloc(sizeof(FtSpec));
-  if (s == NULL) {
-    err_fail("out of memory");
-  }
-  ft_parse(t, s);
-  ft_check(s);
+  u64     n  = 0;
+  char*   t  = io_cbuf(e, spec, &n, CID(SCon));
+  FtEnt*  en = ft_spec_get(t, n);
+  FtSpec* s  = en->s;
+  free(t);
 #if BEND_CUDA
   double t0 = ft_gpu && ft_prof() ? ft_now() : 0;
   bool   fast = false;
@@ -5336,7 +6587,7 @@ OUTLINE Term ft_einsum(Env e, Term spec, Term x) {
   }
   if (!fast) {
     FT_WAIT();
-    ft_einsum_loop(e, s, x);
+    ft_einsum_cpu(e, en, x);
   }
   // BEND_FT_DUMP=dir writes each kernel's source there (to check offline)
   const char* dump = getenv("BEND_FT_DUMP");
@@ -5363,10 +6614,10 @@ OUTLINE Term ft_einsum(Env e, Term spec, Term x) {
     }
   }
 #else
-  ft_einsum_loop(e, s, x);
+  (void)s;
+  ft_einsum_cpu(e, en, x);
 #endif
-  free(s);
-  free(t);
+  ft_spec_put(en);
   return x;
 #endif
 }
