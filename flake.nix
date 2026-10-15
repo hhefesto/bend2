@@ -10,6 +10,13 @@
 # `nix profile install github:bendlang/bend`, `nix run github:bendlang/bend`,
 # or `inputs.bend.url = "github:bendlang/bend"` and
 # `inputs.bend.packages.${system}.default` in a flake.
+#
+# The ft-kernels fork (github:hhefesto/bend2) adds one package and renames
+# one: `default` is THIS source tree run by Bun (bend2/main.ts, with the
+# fork's bulk GPU ops and file effects; calling main.ts directly also skips
+# the release launcher's telemetry and self-update), and upstream's release
+# archive is `release`. Everything else is upstream's, as release.ts wrote
+# it, so a rebase conflicts here only on the version and hashes.
 {
   description = "Bend: C speed, CUDA parallelism, Lean proofs, Python syntax";
 
@@ -26,9 +33,30 @@
       };
       each = f: nixpkgs.lib.mapAttrs (system: archive:
         f (import nixpkgs { inherit system; }) archive) archives;
+      # the files bend2/main.ts reads at run time: the compiler and runtime,
+      # and the guide it prints
+      source = nixpkgs.lib.fileset.toSource {
+        root = ./.;
+        fileset = nixpkgs.lib.fileset.unions [ ./bend2 ./guide ./LICENSE ];
+      };
     in {
       packages = each (pkgs: archive: {
-        default = pkgs.stdenv.mkDerivation {
+        default = pkgs.writeShellApplication {
+          name = "bend";
+          runtimeInputs = [ pkgs.bun ]
+            ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.clang;
+          text = ''
+            export BEND_NO_TELEMETRY=1
+            ${if pkgs.stdenv.hostPlatform.isLinux then "unset CC"
+              else ": \"''${CC:=/usr/bin/clang}\"; export CC"}
+            exec bun ${source}/bend2/main.ts "$@"
+          '';
+          meta = {
+            description = "Bend from source (the ft-kernels fork)";
+            mainProgram = "bend";
+          };
+        };
+        release = pkgs.stdenv.mkDerivation {
           pname = "bend";
           version = ver;
           src = pkgs.fetchurl {

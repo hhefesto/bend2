@@ -477,7 +477,11 @@ function cli_build(bin: string, file: string): void {
   const cuda  = [process.env.CUDA_HOME, process.env.CUDA_PATH,
     "/usr/local/cuda", "/opt/cuda"]
     .find(d => d && fs.existsSync(d + "/include/nvrtc.h")) ?? "";
-  const bangs = !/^#define BANGS\s+0$/m.test(c) && (mac || cuda !== "");
+  const nvrtc = mac || cuda !== "";
+  const bangs = !/^#define BANGS\s+0$/m.test(c) && nvrtc;
+  // bulk ops alone (Array.gemm, Array.einsum): a CUDA build, but no device
+  // program to embed or compile ahead
+  const ftops = !mac && !bangs && nvrtc && !/^#define FTOPS\s+0$/m.test(c);
   const cc    = cc_find(bangs);
   const objc  = mac && (bangs || /^#import /m.test(c))
     ? ["-x", "objective-c", "-fobjc-arc", "-fmodules"] : [];
@@ -489,7 +493,8 @@ function cli_build(bin: string, file: string): void {
     : ["-DBEND_CUDA=1", "-I" + cuda + "/include", "-L" + cuda + "/lib64",
       "-L" + cuda + "/lib", ...cpu, "-lcuda", "-lnvrtc"];
   const steps: [string, string[]][] = bangs
-    ? [[cc, gpu], [path.resolve(bin), ["+RTS", "--gpu-build"]]] : [[cc, cpu]];
+    ? [[cc, gpu], [path.resolve(bin), ["+RTS", "--gpu-build"]]]
+    : ftops ? [[cc, ["-DBEND_NO_SRC", ...gpu]]] : [[cc, cpu]];
   for (const [cmd, args] of steps) {
     if (child.spawnSync(cmd, args, { stdio: "inherit",
       env: { ...process.env, BENDRTS: "" } }).status !== 0) {
