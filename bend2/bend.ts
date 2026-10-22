@@ -2792,6 +2792,139 @@ export function body_flatten(b: Body, vars: PVar[], fr: () => number): LTerm {
 // a rewrite demands its evidence and steps to its body on {==}, else
 // sticks as a value.
 
+// Record eta (ft fork)
+// =====================
+// a record is a datatype with one constructor whose fields never name
+// the datatype itself. a value of a record type is its rebuilt fields:
+// a match on a neutral record (a variable, a stuck call) does not get
+// stuck, it goes on with the fields taken by projections, and a
+// projection (a one-case match answering a field) on a neutral is the
+// canonical stuck form, so two projection defs of one field agree.
+// conversion compares a constructor with a neutral field by field. the
+// rule lives in reduction for checking only; the compiled match is
+// untouched, so quantities and the runtime do not change.
+
+const ETA_ARITY: WeakMap<Book, Map<Name, number>> = new WeakMap();
+const ETA_FRESH: number = 1 << 29;
+
+// whether the top-level name nm reaches k: an ADT by its constructors'
+// types, a def by its body. Word.Con's field is Word(p), a def whose
+// body names Word.Con: a recursive datatype may name itself only so
+function eta_reaches(book: Book, nm: Name, k: Name, fuel: { n: number }, seen: Set<Name>): boolean {
+  if (nm === k) {
+    return true;
+  }
+  if (seen.has(nm)) {
+    return false;
+  }
+  seen.add(nm);
+  const d = book.tlds[nm];
+  if (d === undefined) {
+    return false;
+  }
+  if (d.$ === "ADT") {
+    return d.c.some((x) => {
+      const c = book.ctrs[x.k];
+      return c !== undefined && eta_mentions(book, c.T, k, 0, fuel, seen);
+    });
+  }
+  return d.$ === "Def" && d.v !== null && eta_mentions(book, d.v, k, 0, fuel, seen);
+}
+
+function eta_mentions(book: Book, tm: HTerm, k: Name, dep: number, fuel: { n: number }, seen: Set<Name>): boolean {
+  if (fuel.n-- <= 0) {
+    return true;
+  }
+  const t = term_strip(tm);
+  switch (t.$) {
+    case "ADT": return eta_reaches(book, t.k, k, fuel, seen) || t.x.some((x) => eta_mentions(book, x, k, dep, fuel, seen));
+    case "Ref": return eta_reaches(book, t.k, k, fuel, seen);
+    case "All": return eta_mentions(book, t.A, k, dep, fuel, seen) || eta_mentions(book, t.B(Var("_", ETA_FRESH + dep)), k, dep + 1, fuel, seen);
+    case "Lam": return eta_mentions(book, t.f(Var("_", ETA_FRESH + dep)), k, dep + 1, fuel, seen);
+    case "App": return eta_mentions(book, t.f, k, dep, fuel, seen) || eta_mentions(book, t.x, k, dep, fuel, seen);
+    case "Ctr": return t.x.some((x) => eta_mentions(book, x, k, dep, fuel, seen));
+    case "Eql": return eta_mentions(book, t.a, k, dep, fuel, seen) || eta_mentions(book, t.b, k, dep, fuel, seen) || eta_mentions(book, t.T, k, dep, fuel, seen);
+    case "Typ": return eta_mentions(book, t.g, k, dep, fuel, seen);
+    case "Min": return eta_mentions(book, t.a, k, dep, fuel, seen) || eta_mentions(book, t.b, k, dep, fuel, seen);
+    case "Mat": return eta_mentions(book, t.h, k, dep, fuel, seen) || eta_mentions(book, t.m, k, dep, fuel, seen);
+    case "Rwt": return eta_mentions(book, t.e, k, dep, fuel, seen) || eta_mentions(book, t.p, k, dep, fuel, seen) || eta_mentions(book, t.f, k, dep, fuel, seen);
+    default: return false;
+  }
+}
+
+// whether a field's type names the datatype k (the constructor's type
+// is its params' then its fields' Pis, ending at k itself)
+function eta_fields_mention(book: Book, T: HTerm, params: number, fields: number, k: Name): boolean {
+  const fuel = { n: 100000 };
+  const seen: Set<Name> = new Set();
+  let t = term_strip(T);
+  for (let i = 0; i < params + fields; i++) {
+    if (t.$ !== "All") {
+      return true;
+    }
+    if (i >= params && eta_mentions(book, t.A, k, i, fuel, seen)) {
+      return true;
+    }
+    t = term_strip(t.B(Var("_", ETA_FRESH + i)));
+  }
+  return false;
+}
+
+// the field count of constructor c when it is a record's, else -1
+export function eta_arity(book: Book, c: Name): number {
+  let memo = ETA_ARITY.get(book);
+  if (memo === undefined) {
+    memo = new Map();
+    ETA_ARITY.set(book, memo);
+  }
+  const hit = memo.get(c);
+  if (hit !== undefined) {
+    return hit;
+  }
+  const ctr = book.ctrs[c];
+  if (ctr === undefined) {
+    return -1;
+  }
+  let n = -1;
+  for (const t of Object.keys(book.tlds)) {
+    const d = book.tlds[t];
+    if (d.$ === "ADT" && d.c.some((x) => x.k === c)) {
+      if (d.c.length === 1 && !eta_fields_mention(book, ctr.T, d.n, ctr.n, t)) {
+        n = ctr.n;
+      }
+      memo.set(c, n);
+      break;
+    }
+  }
+  return n;
+}
+
+// the projection of field j of constructor c (of n fields)
+export function eta_proj(c: Name, n: number, j: number): HTerm {
+  const go = (i: number, xs: HTerm[]): HTerm =>
+    i === n ? xs[j] : Lam("_", i, (x: HTerm) => go(i + 1, xs.concat([x])));
+  return Mat(c, go(0, []), Efq());
+}
+
+// a neutral: what a match may be stuck on
+function eta_neutral(tm: HTerm): boolean {
+  const t = term_strip(tm);
+  return t.$ === "Var" || t.$ === "App" || t.$ === "Rwt" || t.$ === "Ref";
+}
+
+// which field a one-case match answers, or -1
+function eta_field(book: Book, h: HTerm, n: number): number {
+  const xs: HTerm[] = [];
+  let t: HTerm = h;
+  for (let i = 0; i < n; i++) {
+    const x = Var("_", ETA_FRESH + 4096 + i);
+    xs.push(x);
+    t = term_apply(t, x);
+  }
+  const r = term_strip(term_wnf(book, t));
+  return r.$ === "Var" ? xs.findIndex((x) => (x as { i: number }).i === r.i) : -1;
+}
+
 export function term_wnf(book: Book, term: HTerm): HTerm {
   const frs: Frame[] = [];
   let tm: HTerm = term;
@@ -2988,6 +3121,28 @@ export function term_wnf(book: Book, term: HTerm): HTerm {
                 }
               }
             }
+            // record eta: a match on a neutral record
+            if (eta_neutral(tm)) {
+              let t: HTerm = fr.t;
+              while (t.$ === "Ann") {
+                t = t.x;
+              }
+              const n = t.$ === "Mat" ? eta_arity(book, t.k) : -1;
+              if (t.$ === "Mat" && n >= 0) {
+                const j = eta_field(book, t.h, n);
+                if (j >= 0) {
+                  tm = App(eta_proj(t.k, n, j), tm, fr.s);
+                  continue back;
+                }
+                const sc = term_cell(tm);
+                lhs = null;
+                for (let i = n - 1; i >= 0; i--) {
+                  frs.push({ $: "APP", x: term_cell(App(eta_proj(t.k, n, i), sc)) });
+                }
+                tm = t.h;
+                continue main;
+              }
+            }
             tm = term_apply(fr.lhs === null ? fr.t : fr.lhs.t(), fr.e, fr.s);
             continue back;
           }
@@ -3092,6 +3247,17 @@ function compare_go(mode: "EQ" | "LE", book: Book, lhs: HTerm, rhs: HTerm, dep: 
   }
   if (b.$ === "Lit" && a.$ === "Ctr") {
     b = lit_step(b);
+  }
+  // record eta: a constructor against a neutral, field by field
+  if ((a.$ === "Ctr") !== (b.$ === "Ctr")) {
+    const [c, o] = a.$ === "Ctr" ? [a, b] : [b as Extract<HTerm, { $: "Ctr" }>, a];
+    const n = eta_neutral(o) ? eta_arity(book, c.k) : -1;
+    if (n >= 0 && n === c.x.length) {
+      return c.x.every((x, j) => {
+        const p = App(eta_proj(c.k, n, j), o);
+        return a === c ? compare_go("EQ", book, x, p, dep) : compare_go("EQ", book, p, x, dep);
+      });
+    }
   }
   switch (a.$) {
     case "Var": {
